@@ -1,0 +1,69 @@
+#version 450
+
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer QBuffer { float q[]; };
+layout(set = 0, binding = 1, std430) readonly buffer KBuffer { float k[]; };
+layout(set = 0, binding = 2, std430) readonly buffer VBuffer { float v[]; };
+layout(set = 0, binding = 3, std430) buffer OutputBuffer { float output_data[]; };
+
+layout(push_constant) uniform Push { uint p[6]; } pc;
+shared float partial[128];
+shared float maximum;
+shared float rescale;
+shared float probability;
+shared float denominator;
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint group = gl_WorkGroupID.x;
+    uint seq_q = pc.p[0];
+    uint seq_k = pc.p[1];
+    uint heads = pc.p[2];
+    uint head_dim = pc.p[3];
+    uint hidden = heads * head_dim;
+    uint query = pc.p[5] + group / heads;
+    uint head = group - (group / heads) * heads;
+    float scale = uintBitsToFloat(pc.p[4]);
+    if (query >= seq_q || head_dim > 128u) return;
+
+    uint query_base = query * hidden + head * head_dim;
+    float value = 0.0;
+    if (lane == 0u) {
+        maximum = -3.402823466e+38;
+        denominator = 0.0;
+    }
+    barrier();
+
+    for (uint key = 0u; key < seq_k; key++) {
+        float dot = 0.0;
+        if (lane < head_dim) {
+            dot = q[query_base + lane] * k[key * hidden + head * head_dim + lane];
+        }
+        partial[lane] = dot;
+        barrier();
+        for (uint stride = 64u; stride > 0u; stride >>= 1u) {
+            if (lane < stride) partial[lane] += partial[lane + stride];
+            barrier();
+        }
+        if (lane == 0u) {
+            float scaled_score = partial[0] * scale;
+            float old_maximum = maximum;
+            float new_maximum = max(old_maximum, scaled_score);
+            maximum = new_maximum;
+            rescale = exp(old_maximum - new_maximum);
+            probability = exp(scaled_score - new_maximum);
+            denominator = denominator * rescale + probability;
+        }
+        barrier();
+        if (lane < head_dim) {
+            value = value * rescale + probability *
+                    v[key * hidden + head * head_dim + lane];
+        }
+        barrier();
+    }
+
+    if (lane < head_dim) {
+        output_data[query_base + lane] = value / denominator;
+    }
+}

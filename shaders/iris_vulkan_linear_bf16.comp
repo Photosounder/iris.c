@@ -1,0 +1,30 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer XBuffer { float x[]; };
+layout(set = 0, binding = 1, std430) readonly buffer WeightBuffer { uint weight[]; };
+layout(set = 0, binding = 2, std430) buffer OutputBuffer { float output_data[]; };
+
+layout(push_constant) uniform Push { uint p[3]; } pc;
+
+float load_bf16(uint index) {
+    uint packed = weight[index >> 1];
+    uint bits = ((index & 1u) == 0u) ? (packed & 0xffffu) : (packed >> 16u);
+    return uintBitsToFloat(bits << 16u);
+}
+
+void main() {
+    uint row = gl_GlobalInvocationID.y;
+    uint col = gl_GlobalInvocationID.x;
+    uint rows = pc.p[0];
+    uint inner = pc.p[1];
+    uint cols = pc.p[2];
+    if (row >= rows || col >= cols) return;
+
+    float sum = 0.0;
+    for (uint i = 0; i < inner; i++) {
+        sum += x[row * inner + i] * load_bf16(col * inner + i);
+    }
+    output_data[row * cols + col] = sum;
+}

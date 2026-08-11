@@ -1,0 +1,26 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer XBuffer { float x[]; };
+layout(set = 0, binding = 1, std430) readonly buffer WeightBuffer { float weight[]; };
+layout(set = 0, binding = 2, std430) readonly buffer BiasBuffer { float bias[]; };
+layout(set = 0, binding = 3, std430) buffer OutputBuffer { float output_data[]; };
+
+layout(push_constant) uniform Push { uint p[4]; } pc;
+
+void main() {
+    uint row = gl_GlobalInvocationID.y;
+    uint col = gl_GlobalInvocationID.x;
+    uint rows = pc.p[0];
+    uint inner = pc.p[1];
+    uint cols = pc.p[2];
+    if (row >= rows || col >= cols) return;
+
+    float sum = 0.0;
+    for (uint i = 0; i < inner; i++) {
+        sum += x[row * inner + i] * weight[col * inner + i];
+    }
+    if (pc.p[3] != 0) sum += bias[col];
+    output_data[row * cols + col] = sum;
+}

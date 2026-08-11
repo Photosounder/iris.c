@@ -1,0 +1,37 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer XBuffer { float x[]; };
+layout(set = 0, binding = 1, std430) readonly buffer ShiftBuffer { float shift[]; };
+layout(set = 0, binding = 2, std430) readonly buffer ScaleBuffer { float scale[]; };
+layout(set = 0, binding = 3, std430) buffer OutputBuffer { float output_data[]; };
+
+layout(push_constant) uniform Push { uint p[3]; } pc;
+shared float partial[256];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint lane = gl_LocalInvocationID.x;
+    uint rows = pc.p[0];
+    uint hidden = pc.p[1];
+    if (row >= rows) return;
+
+    float sum = 0.0;
+    for (uint i = lane; i < hidden; i += 256u) {
+        float value = x[row * hidden + i];
+        sum += value * value;
+    }
+    partial[lane] = sum;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) partial[lane] += partial[lane + stride];
+        barrier();
+    }
+
+    float inv_rms = inversesqrt(partial[0] / float(hidden) + uintBitsToFloat(pc.p[2]));
+    for (uint i = lane; i < hidden; i += 256u) {
+        output_data[row * hidden + i] =
+            x[row * hidden + i] * inv_rms * (1.0 + scale[i]) + shift[i];
+    }
+}

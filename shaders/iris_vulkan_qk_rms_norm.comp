@@ -1,0 +1,51 @@
+#version 450
+
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0, std430) buffer QBuffer { float q[]; };
+layout(set = 0, binding = 1, std430) buffer KBuffer { float k[]; };
+layout(set = 0, binding = 2, std430) readonly buffer QWeightBuffer { float q_weight[]; };
+layout(set = 0, binding = 3, std430) readonly buffer KWeightBuffer { float k_weight[]; };
+
+layout(push_constant) uniform Push { uint p[4]; } pc;
+shared float q_partial[128];
+shared float k_partial[128];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint lane = gl_LocalInvocationID.x;
+    uint rows = pc.p[0];
+    uint head_dim = pc.p[1];
+    uint heads = pc.p[3];
+    if (row >= rows) return;
+
+    uint sequence = row / heads;
+    uint head = row - sequence * heads;
+    uint base = sequence * heads * head_dim + head * head_dim;
+
+    float q_sum = 0.0;
+    float k_sum = 0.0;
+    for (uint i = lane; i < head_dim; i += 128u) {
+        float q_value = q[base + i];
+        float k_value = k[base + i];
+        q_sum += q_value * q_value;
+        k_sum += k_value * k_value;
+    }
+    q_partial[lane] = q_sum;
+    k_partial[lane] = k_sum;
+    barrier();
+    for (uint stride = 64u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) {
+            q_partial[lane] += q_partial[lane + stride];
+            k_partial[lane] += k_partial[lane + stride];
+        }
+        barrier();
+    }
+
+    float q_inv = inversesqrt(q_partial[0] / float(head_dim) + uintBitsToFloat(pc.p[2]));
+    float k_inv = inversesqrt(k_partial[0] / float(head_dim) + uintBitsToFloat(pc.p[2]));
+    for (uint i = lane; i < head_dim; i += 128u) {
+        q[base + i] *= q_inv * q_weight[i];
+        k[base + i] *= k_inv * k_weight[i];
+    }
+}

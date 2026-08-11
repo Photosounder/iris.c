@@ -57,6 +57,18 @@ pip install huggingface_hub && python download_model.py zimage-turbo
 
 That's it. No Python runtime or CUDA toolkit required at inference time.
 
+### Windows and Vulkan
+
+On Windows, build the Z-Image Vulkan backend from an MSYS2 UCRT64 shell after installing the Vulkan SDK/runtime and OpenBLAS:
+
+```bash
+export PATH=/ucrt64/bin:/usr/bin:$PATH
+make vulkan
+./iris -d zimage-turbo -p "a fish" -o fish.png
+```
+
+For a dispatch and memory trace while diagnosing a driver problem, set `IRIS_VULKAN_TRACE=1` before running Iris.
+
 ## Example Output
 
 ![Woman with sunglasses](images/woman_with_sunglasses.png)

@@ -1,0 +1,16 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) buffer OutputBuffer { float output_data[]; };
+layout(set = 0, binding = 1, std430) readonly buffer ProjectionBuffer { float projection[]; };
+layout(set = 0, binding = 2, std430) readonly buffer GateBuffer { float gate[]; };
+
+layout(push_constant) uniform Push { uint p[2]; } pc;
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    uint hidden = pc.p[1];
+    if (index >= pc.p[0] * hidden) return;
+    output_data[index] += gate[index % hidden] * projection[index];
+}

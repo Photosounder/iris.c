@@ -19,11 +19,14 @@ CLI_OBJS = $(CLI_SRCS:.c=.o)
 MAIN = main.c
 TARGET = iris$(if $(IS_WINDOWS),.exe,)
 LIB = libiris.a
+VULKAN_OBJS = iris_vulkan.o
+VULKAN_SHADER_SRCS = $(wildcard shaders/*.comp)
+VULKAN_SHADER_BINS = $(VULKAN_SHADER_SRCS:.comp=.comp.spv)
 
 # Debug build flags
 DEBUG_CFLAGS = -Wall -Wextra -g -O0 -DDEBUG -fsanitize=address
 
-.PHONY: all clean debug lib install info test pngtest help generic blas mps windows
+.PHONY: all clean debug lib install info test pngtest help generic blas vulkan vulkan-shaders vulkan-build mps windows
 .NOTPARALLEL: mps
 
 # Default: show available targets
@@ -35,6 +38,7 @@ help:
 	@echo "Choose a backend:"
 	@echo "  make generic  - Pure C, no dependencies (slow)"
 	@echo "  make blas     - With BLAS acceleration (~30x faster)"
+	@echo "  make vulkan   - Vulkan compute backend for Z-Image"
 ifeq ($(IS_WINDOWS),)
 ifeq ($(UNAME_S),Darwin)
 ifeq ($(UNAME_M),arm64)
@@ -81,6 +85,26 @@ endif
 blas: clean $(TARGET)
 	@echo ""
 	@echo "Built with BLAS backend (~30x faster than generic)"
+
+# =============================================================================
+# Backend: vulkan compute
+# =============================================================================
+VULKAN_CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DUSE_OPENBLAS -DUSE_VULKAN -I/ucrt64/include/openblas
+VULKAN_LDFLAGS = -lm -lopenblas -lvulkan-1 -lpthread
+
+vulkan: CFLAGS = $(VULKAN_CFLAGS)
+vulkan: LDFLAGS = $(VULKAN_LDFLAGS)
+vulkan: clean vulkan-shaders vulkan-build
+	@echo ""
+	@echo "Built with Vulkan compute backend"
+
+vulkan-shaders: $(VULKAN_SHADER_BINS)
+
+vulkan-build: $(OBJS) $(CLI_OBJS) $(VULKAN_OBJS) main.o
+	$(CC) $(CFLAGS) -o $(TARGET) $^ $(LDFLAGS)
+
+shaders/%.comp.spv: shaders/%.comp
+	glslc --target-env=vulkan1.2 -O -o $@ $<
 
 # =============================================================================
 # Backend: mps (Apple Silicon Metal GPU)
@@ -170,7 +194,8 @@ install: $(TARGET) $(LIB)
 endif
 
 clean:
-	rm -f $(OBJS) $(CLI_OBJS) *.mps.o iris_metal.o main.o $(TARGET) $(LIB)
+	rm -f $(OBJS) $(CLI_OBJS) $(VULKAN_OBJS) *.mps.o iris_metal.o main.o $(TARGET) $(LIB)
+	rm -f $(VULKAN_SHADER_BINS)
 	rm -f iris_shaders_source.h
 
 info:
