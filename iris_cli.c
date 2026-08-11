@@ -18,6 +18,7 @@
 
 #include "iris.h"
 #include "iris_kernels.h"
+#include "iris_platform.h"
 #include "iris_qwen3.h"  /* For QWEN3_MAX_SEQ_LEN */
 #include "embcache.h"
 #include "linenoise.h"
@@ -32,7 +33,7 @@
 
 #define CLI_HISTORY_FILE ".iris_history"
 #define CLI_MAX_PATH 4096
-#define CLI_MAX_TMPDIR 256
+#define CLI_MAX_TMPDIR 512
 #define CLI_DEFAULT_WIDTH 256
 #define CLI_DEFAULT_HEIGHT 256
 #define CLI_DEFAULT_STEPS 4
@@ -111,7 +112,7 @@ static int ref_add(const char *path) {
     }
 
     int id = state.refs_count + 1;  /* IDs are 1-based */
-    state.refs[state.refs_count].path = strdup(path);
+    state.refs[state.refs_count].path = iris_strdup(path);
     if (!state.refs[state.refs_count].path) {
         fprintf(stderr, "Error: Out of memory for path\n");
         return -1;
@@ -181,7 +182,7 @@ static char *extract_size_from_prompt(const char *prompt, int *w, int *h) {
     if (after) {
         after = skip_spaces(after);
         if (*after) {
-            result = strdup(after);
+            result = iris_strdup(after);
             return result;
         }
     }
@@ -228,8 +229,8 @@ static char *extract_size_from_prompt(const char *prompt, int *w, int *h) {
  * ====================================================================== */
 
 static int create_tmpdir(void) {
-    snprintf(state.tmpdir, sizeof(state.tmpdir), "/tmp/iris-XXXXXX");
-    if (mkdtemp(state.tmpdir) == NULL) {
+    /* Create session output under the platform's temporary directory. */
+    if (iris_create_temp_dir(state.tmpdir, sizeof(state.tmpdir)) != 0) {
         fprintf(stderr, "Error: Cannot create temp directory: %s\n",
                 strerror(errno));
         return -1;
@@ -382,8 +383,7 @@ static int generate_image(const char *prompt, const char *ref_image,
     }
 
     /* Start timing */
-    struct timespec start_time, end_time;
-    clock_gettime(CLOCK_MONOTONIC, &start_time);
+    double start_time = iris_time_ms();
 
     /* Set up progress callbacks */
     cli_prepare_next_generation();
@@ -460,9 +460,7 @@ static int generate_image(const char *prompt, const char *ref_image,
     if (ref) iris_image_free(ref);
 
     /* End timing */
-    clock_gettime(CLOCK_MONOTONIC, &end_time);
-    double elapsed = (end_time.tv_sec - start_time.tv_sec) +
-                     (end_time.tv_nsec - start_time.tv_nsec) / 1e9;
+    double elapsed = (iris_time_ms() - start_time) / 1000.0;
 
     if (!img) {
         fprintf(stderr, "Error: Generation failed: %s\n", iris_get_error());
@@ -509,8 +507,7 @@ static int generate_multiref(const char *prompt, const char **ref_paths, int num
     printf("Seed: %lld\n", (long long)actual_seed);
 
     /* Start timing */
-    struct timespec start_time, end_time;
-    clock_gettime(CLOCK_MONOTONIC, &start_time);
+    double start_time = iris_time_ms();
 
     /* Load reference images */
     iris_image **refs = (iris_image **)malloc(num_refs * sizeof(iris_image *));
@@ -554,9 +551,7 @@ static int generate_multiref(const char *prompt, const char **ref_paths, int num
     iris_set_step_image_callback(state.ctx, NULL);
 
     /* End timing */
-    clock_gettime(CLOCK_MONOTONIC, &end_time);
-    double elapsed = (end_time.tv_sec - start_time.tv_sec) +
-                     (end_time.tv_nsec - start_time.tv_nsec) / 1e9;
+    double elapsed = (iris_time_ms() - start_time) / 1000.0;
 
     if (!img) {
         fprintf(stderr, "Error: Generation failed: %s\n", iris_get_error());
@@ -1142,6 +1137,10 @@ int iris_cli_run(iris_ctx *ctx, const char *model_dir) {
     /* Setup history */
     char history_path[CLI_MAX_PATH];
     const char *home = getenv("HOME");
+#ifdef _WIN32
+    /* Use the Windows profile directory when HOME is not set. */
+    if (!home) home = getenv("USERPROFILE");
+#endif
     if (home) {
         snprintf(history_path, sizeof(history_path), "%s/%s",
                  home, CLI_HISTORY_FILE);

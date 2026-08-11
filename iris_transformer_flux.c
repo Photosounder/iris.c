@@ -16,12 +16,12 @@
 #include "iris.h"
 #include "iris_kernels.h"
 #include "iris_safetensors.h"
+#include "iris_platform.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <time.h>
-#include <sys/time.h>
 
 /* External timing counters from iris_sample.c */
 extern double iris_timing_transformer_total;
@@ -40,9 +40,8 @@ static double prof_single_proj_matmul = 0;
 static double prof_single_gated_add = 0;
 
 static double prof_get_time(void) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
+    /* Use the platform timer implementation for this measurement. */
+    return iris_time_ms();
 }
 
 void iris_print_blas_profile(void) {
@@ -70,9 +69,8 @@ void iris_reset_blas_profile(void) {
 
 /* Helper to get current time in ms (wall-clock) */
 static double tf_get_time_ms(void) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
+    /* Use the platform timer implementation for this measurement. */
+    return iris_time_ms();
 }
 
 /* Use BLAS for matrix operations when enabled via Makefile */
@@ -1562,7 +1560,8 @@ static void *joint_attn_thread_worker(void *arg) {
 static int get_attn_num_threads(int heads) {
     static int cached = 0;
     if (cached) return cached;
-    int ncpu = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    /* Use the platform processor count for head-level parallelism. */
+    int ncpu = iris_cpu_count();
     if (ncpu < 2) { cached = 1; return 1; }
     if (ncpu > heads) ncpu = heads;
     /* Round down to divide heads evenly */

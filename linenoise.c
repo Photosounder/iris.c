@@ -103,6 +103,130 @@
  *
  */
 
+#ifdef _WIN32
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "iris_platform.h"
+#include "linenoise.h"
+
+static char **windows_history;
+static int windows_history_len;
+static int windows_history_max_len = 100;
+char *linenoiseEditMore = "Windows console input is blocking";
+
+char *linenoise(const char *prompt) {
+    char buffer[4096];
+
+    /* Use the Windows console's built-in line editing and history-friendly input. */
+    fputs(prompt, stdout);
+    fflush(stdout);
+    if (!fgets(buffer, sizeof(buffer), stdin)) return NULL;
+    buffer[strcspn(buffer, "\r\n")] = '\0';
+    return iris_strdup(buffer);
+}
+
+void linenoiseFree(void *ptr) {
+    /* Release buffers returned by the blocking Windows implementation. */
+    if (ptr == linenoiseEditMore) return;
+    free(ptr);
+}
+
+int linenoiseHistoryAdd(const char *line) {
+    char **new_history;
+    char *line_copy;
+
+    /* Append a unique entry and retain only the configured number of lines. */
+    if (!line || !*line || windows_history_max_len < 1) return 0;
+    if (windows_history_len > 0 &&
+        strcmp(windows_history[windows_history_len - 1], line) == 0) return 0;
+    if (windows_history_len == windows_history_max_len) {
+        free(windows_history[0]);
+        memmove(windows_history, windows_history + 1,
+                sizeof(char *) * (size_t)(windows_history_len - 1));
+        windows_history_len--;
+    }
+    line_copy = iris_strdup(line);
+    if (!line_copy) return 0;
+    new_history = (char **)realloc(windows_history,
+                                   sizeof(char *) * (size_t)(windows_history_len + 1));
+    if (!new_history) {
+        free(line_copy);
+        return 0;
+    }
+    windows_history = new_history;
+    windows_history[windows_history_len++] = line_copy;
+    return 1;
+}
+
+int linenoiseHistorySetMaxLen(int len) {
+    /* Update the history limit and discard the oldest excess entries. */
+    if (len < 1) return 0;
+    while (windows_history_len > len) {
+        free(windows_history[0]);
+        memmove(windows_history, windows_history + 1,
+                sizeof(char *) * (size_t)(windows_history_len - 1));
+        windows_history_len--;
+    }
+    windows_history_max_len = len;
+    return 1;
+}
+
+int linenoiseHistorySave(const char *filename) {
+    FILE *file;
+    int i;
+
+    /* Write history entries as UTF-8 text using the normal Windows CRT. */
+    file = fopen(filename, "w");
+    if (!file) return -1;
+    for (i = 0; i < windows_history_len; i++) fprintf(file, "%s\n", windows_history[i]);
+    fclose(file);
+    return 0;
+}
+
+int linenoiseHistoryLoad(const char *filename) {
+    FILE *file;
+    char buffer[4096];
+
+    /* Load existing history when the file is available. */
+    file = fopen(filename, "r");
+    if (!file) return -1;
+    while (fgets(buffer, sizeof(buffer), file)) {
+        buffer[strcspn(buffer, "\r\n")] = '\0';
+        linenoiseHistoryAdd(buffer);
+    }
+    fclose(file);
+    return 0;
+}
+
+int linenoiseEditStart(struct linenoiseState *l, int stdin_fd, int stdout_fd,
+                       char *buf, size_t buflen, const char *prompt) {
+    /* Report that nonblocking editing is unavailable on the simple Windows path. */
+    (void)l; (void)stdin_fd; (void)stdout_fd; (void)buf; (void)buflen; (void)prompt;
+    return -1;
+}
+
+char *linenoiseEditFeed(struct linenoiseState *l) {
+    /* Keep the nonblocking API harmless when called by a Windows client. */
+    (void)l;
+    return NULL;
+}
+
+/* Provide no-op implementations for editing features owned by the Windows console. */
+void linenoiseEditStop(struct linenoiseState *l) { (void)l; }
+void linenoiseHide(struct linenoiseState *l) { (void)l; }
+void linenoiseShow(struct linenoiseState *l) { (void)l; }
+void linenoiseSetCompletionCallback(linenoiseCompletionCallback *callback) { (void)callback; }
+void linenoiseSetHintsCallback(linenoiseHintsCallback *callback) { (void)callback; }
+void linenoiseSetFreeHintsCallback(linenoiseFreeHintsCallback *callback) { (void)callback; }
+void linenoiseAddCompletion(linenoiseCompletions *lc, const char *str) { (void)lc; (void)str; }
+void linenoiseClearScreen(void) { fputs("\033[2J\033[H", stdout); }
+void linenoiseSetMultiLine(int ml) { (void)ml; }
+void linenoisePrintKeyCodes(void) { }
+void linenoiseMaskModeEnable(void) { }
+void linenoiseMaskModeDisable(void) { }
+
+#else
 #include <termios.h>
 #include <unistd.h>
 #include <stdlib.h>
@@ -1760,3 +1884,4 @@ int linenoiseHistoryLoad(const char *filename) {
     fclose(fp);
     return 0;
 }
+#endif

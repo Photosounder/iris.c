@@ -291,6 +291,24 @@ sudo apt install libopenblas-dev
 sudo dnf install openblas-devel
 ```
 
+### Windows
+
+Windows builds use the native MinGW/UCRT toolchain. Install the MSYS2 UCRT64 environment with GCC and Make, open an **MSYS2 UCRT64** shell, then run:
+
+```bash
+make windows       # Pure C build with no external runtime dependency
+# or: make blas    # OpenBLAS acceleration, if OpenBLAS is installed
+```
+
+The executable is `iris.exe`. Windows uses native file mappings for the default memory-mapped weight mode, and interactive mode falls back to the Windows console line editor and history file. The Python model downloader works from PowerShell or an MSYS2 shell:
+
+```powershell
+python download_model.py 4b
+.\iris.exe -d .\flux-klein-4b -p "A woman wearing sunglasses" -o output.png
+# Optional quick test:
+python run_test.py --flux-binary .\iris.exe --quick
+```
+
 Other targets:
 ```bash
 make clean      # Clean build artifacts

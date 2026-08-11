@@ -1824,7 +1824,7 @@ void qwen3_encoder_free(qwen3_encoder_t *enc) {
 }
 
 /* Main text encoding API. Tokenizes the prompt using Qwen3 chat template
- * (with <think> tags for Flux, without for Z-Image), pads to max sequence
+ * (with <think> tags for both Flux and Z-Image), pads to max sequence
  * length, runs the forward pass, and returns extracted embeddings. Also
  * returns the number of real (non-padding) tokens via out_num_tokens,
  * which Z-Image needs for its unpadded attention over text tokens. */
@@ -1832,7 +1832,8 @@ float *qwen3_encode_text_ex(qwen3_encoder_t *enc, const char *prompt,
                               int *out_num_tokens) {
     if (!enc || !enc->tokenizer || !enc->model || !prompt) return NULL;
 
-    int skip_think_tags = (enc->model->extraction_mode == 1);
+    /* Preserve the thinking tokens expected by the Z-Image conditioning path */
+    int skip_think_tags = 0;
 
     /* Tokenize with chat template */
     int num_tokens;

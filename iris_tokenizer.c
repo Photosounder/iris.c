@@ -6,6 +6,7 @@
  */
 
 #include "iris.h"
+#include "iris_platform.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -80,7 +81,7 @@ static void vocab_hash_insert(vocab_entry_t *table, int hash_size,
         }
         h = (h + 1) % hash_size;
     }
-    table[h].token = strdup(token);
+        table[h].token = iris_strdup(token);
     table[h].id = id;
 }
 
@@ -451,7 +452,7 @@ int *iris_tokenize(iris_tokenizer *tok, const char *text,
 /* Decode tokens back to text */
 char *iris_detokenize(iris_tokenizer *tok, const int *tokens, int num_tokens) {
     if (!tok || !tokens || num_tokens <= 0) {
-        return strdup("");
+        return iris_strdup("");
     }
 
     /* Calculate total length */
@@ -541,13 +542,13 @@ iris_tokenizer *iris_tokenizer_create_simple(void) {
         } else {
             snprintf(buf, sizeof(buf), "<0x%02X>", i);
         }
-        tok->vocab[i] = strdup(buf);
+        tok->vocab[i] = iris_strdup(buf);
         vocab_hash_insert(tok->vocab_hash, tok->hash_size, tok->vocab[i], i);
     }
-    tok->vocab[256] = strdup("<pad>");
-    tok->vocab[257] = strdup("<unk>");
-    tok->vocab[258] = strdup("<bos>");
-    tok->vocab[259] = strdup("<eos>");
+    tok->vocab[256] = iris_strdup("<pad>");
+    tok->vocab[257] = iris_strdup("<unk>");
+    tok->vocab[258] = iris_strdup("<bos>");
+    tok->vocab[259] = iris_strdup("<eos>");
 
     vocab_hash_insert(tok->vocab_hash, tok->hash_size, "<pad>", 256);
     vocab_hash_insert(tok->vocab_hash, tok->hash_size, "<unk>", 257);

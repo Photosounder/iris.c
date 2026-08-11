@@ -16,6 +16,7 @@
 #include "iris.h"
 #include "iris_kernels.h"
 #include "iris_safetensors.h"
+#include "iris_platform.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -52,9 +53,8 @@ extern double iris_timing_zi_main_blocks;
 extern double iris_timing_zi_final;
 
 static inline double zi_time_ms(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1000000.0;
+    /* Use the platform timer implementation for this measurement. */
+    return iris_time_ms();
 }
 
 /* ========================================================================
@@ -712,7 +712,8 @@ static void zi_attention(float *out, const float *x,
 
     /* Scaled dot-product attention per head */
     float scale = 1.0f / sqrtf((float)head_dim);
-    float *attn_out = tf->work_tmp;
+    /* Keep the attention scratch separate from the projected output buffer */
+    float *attn_out = tf->work_ffn;
 
     for (int h = 0; h < n_heads; h++) {
         float *scores = tf->work_attn;
@@ -1883,9 +1884,10 @@ float *iris_transformer_forward_zimage(zi_transformer_t *tf,
     for (int i = 0; i < cap_seq_len; i++) cap_mask[i] = 1;
     for (int i = cap_seq_len; i < cap_padded; i++) cap_mask[i] = 0;
 
+    /* Let padded tokens participate in attention like the reference model */
     /* 5. Noise refiner: image-only self-attention with modulation */
     for (int i = 0; i < tf->n_refiner; i++) {
-        zi_block_forward(img_emb, &tf->noise_refiner[i], img_pos, img_mask,
+        zi_block_forward(img_emb, &tf->noise_refiner[i], img_pos, NULL,
                           t_emb, img_padded, tf);
         if (iris_substep_callback)
             iris_substep_callback(IRIS_SUBSTEP_DOUBLE_BLOCK, i, refiner_total);
@@ -1893,7 +1895,7 @@ float *iris_transformer_forward_zimage(zi_transformer_t *tf,
 
     /* 6. Context refiner: caption-only self-attention without modulation */
     for (int i = 0; i < tf->n_refiner; i++) {
-        zi_block_forward(cap_emb, &tf->context_refiner[i], cap_pos, cap_mask,
+        zi_block_forward(cap_emb, &tf->context_refiner[i], cap_pos, NULL,
                           NULL, cap_padded, tf);
         if (iris_substep_callback)
             iris_substep_callback(IRIS_SUBSTEP_DOUBLE_BLOCK, tf->n_refiner + i, refiner_total);
@@ -1935,7 +1937,7 @@ float *iris_transformer_forward_zimage(zi_transformer_t *tf,
 
     /* 8. Main transformer layers */
     for (int i = 0; i < tf->n_layers; i++) {
-        zi_block_forward(unified, &tf->layers[i], unified_pos, unified_mask,
+        zi_block_forward(unified, &tf->layers[i], unified_pos, NULL,
                           t_emb, unified_seq, tf);
         if (iris_substep_callback)
             iris_substep_callback(IRIS_SUBSTEP_SINGLE_BLOCK, i, tf->n_layers);

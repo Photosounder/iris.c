@@ -11,6 +11,7 @@
 #include <ctype.h>
 #include <stdint.h>
 #include "iris_kernels.h"
+#include "iris_platform.h"
 
 /* ========================================================================
  * Configuration
@@ -149,7 +150,7 @@ static void vocab_hash_insert(vocab_entry_t *table, int hash_size,
         probes++;
     }
     if (probes < hash_size) {
-        table[h].token = strdup(token);
+        table[h].token = iris_strdup(token);
         table[h].id = id;
     }
 }
@@ -681,7 +682,7 @@ typedef struct token_node {
 static token_node_t *create_node(const char *text) {
     token_node_t *node = malloc(sizeof(token_node_t));
     if (node) {
-        node->text = strdup(text);
+        node->text = iris_strdup(text);
         node->next = NULL;
     }
     return node;

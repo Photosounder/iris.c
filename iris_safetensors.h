@@ -41,6 +41,9 @@ typedef struct {
 typedef struct {
     char *path;
     void *data;              /* mmap'd file data */
+#ifdef _WIN32
+    void *mapping_handle;    /* Windows file-mapping handle */
+#endif
     size_t file_size;
     size_t header_size;
     char *header_json;

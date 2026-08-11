@@ -3,13 +3,20 @@
  */
 
 #include "iris_safetensors.h"
+#include "iris_platform.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <io.h>
+#else
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#endif
 
 /* Minimal JSON parser for safetensors header */
 
@@ -205,6 +212,47 @@ static int parse_header(safetensors_file_t *sf) {
  * OS page in tensor data on demand, avoiding upfront reads of multi-GB model
  * files -- only the weights actually used get loaded into RAM. */
 safetensors_file_t *safetensors_open(const char *path) {
+    /* Open and map the model file with the platform-native file API. */
+#ifdef _WIN32
+    HANDLE file_handle = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ,
+                                     NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file_handle == INVALID_HANDLE_VALUE) {
+        fprintf(stderr, "safetensors_open: open failed for %s\n", path);
+        return NULL;
+    }
+
+    LARGE_INTEGER file_size_large;
+    if (!GetFileSizeEx(file_handle, &file_size_large) || file_size_large.QuadPart < 0) {
+        fprintf(stderr, "safetensors_open: fstat failed for %s\n", path);
+        CloseHandle(file_handle);
+        return NULL;
+    }
+    size_t file_size = (size_t)file_size_large.QuadPart;
+    if ((unsigned long long)file_size != (unsigned long long)file_size_large.QuadPart) {
+        fprintf(stderr, "safetensors_open: file is too large for this build\n");
+        CloseHandle(file_handle);
+        return NULL;
+    }
+    if (file_size < 8) {
+        fprintf(stderr, "safetensors_open: file too small\n");
+        CloseHandle(file_handle);
+        return NULL;
+    }
+
+    HANDLE mapping_handle = CreateFileMappingA(file_handle, NULL, PAGE_READONLY, 0, 0, NULL);
+    CloseHandle(file_handle);
+    if (!mapping_handle) {
+        fprintf(stderr, "safetensors_open: mmap failed for %s\n", path);
+        return NULL;
+    }
+
+    void *data = MapViewOfFile(mapping_handle, FILE_MAP_READ, 0, 0, 0);
+    if (!data) {
+        fprintf(stderr, "safetensors_open: mmap failed for %s\n", path);
+        CloseHandle(mapping_handle);
+        return NULL;
+    }
+#else
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
         perror("safetensors_open: open failed");
@@ -232,6 +280,7 @@ safetensors_file_t *safetensors_open(const char *path) {
         perror("safetensors_open: mmap failed");
         return NULL;
     }
+#endif
 
     /* Read header size (8-byte little-endian) */
     uint64_t header_size = 0;
@@ -239,18 +288,33 @@ safetensors_file_t *safetensors_open(const char *path) {
 
     if (header_size > file_size - 8) {
         fprintf(stderr, "safetensors_open: invalid header size\n");
+        /* Release the platform mapping before returning an invalid file. */
+#ifdef _WIN32
+        UnmapViewOfFile(data);
+        CloseHandle(mapping_handle);
+#else
         munmap(data, file_size);
+#endif
         return NULL;
     }
 
     safetensors_file_t *sf = calloc(1, sizeof(safetensors_file_t));
     if (!sf) {
+        /* Release the mapping when the file descriptor allocation fails. */
+#ifdef _WIN32
+        UnmapViewOfFile(data);
+        CloseHandle(mapping_handle);
+#else
         munmap(data, file_size);
+#endif
         return NULL;
     }
 
-    sf->path = strdup(path);
+    sf->path = iris_strdup(path);
     sf->data = data;
+#ifdef _WIN32
+    sf->mapping_handle = mapping_handle;
+#endif
     sf->file_size = file_size;
     sf->header_size = (size_t)header_size;
 
@@ -294,7 +358,13 @@ safetensors_file_t *safetensors_open(const char *path) {
 
 void safetensors_close(safetensors_file_t *sf) {
     if (!sf) return;
+    /* Release the mapped view and its backing handle. */
+#ifdef _WIN32
+    if (sf->data) UnmapViewOfFile(sf->data);
+    if (sf->mapping_handle) CloseHandle((HANDLE)sf->mapping_handle);
+#else
     if (sf->data) munmap(sf->data, sf->file_size);
+#endif
     free(sf->path);
     free(sf->header_json);
     free(sf);

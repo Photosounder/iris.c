@@ -24,12 +24,12 @@
 #include "iris_kernels.h"
 #include "iris_cli.h"
 #include "terminals.h"
+#include "iris_platform.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <getopt.h>
 #include <time.h>
-#include <sys/time.h>
 #include <unistd.h>
 
 #ifdef USE_METAL
@@ -111,7 +111,7 @@ static void cli_substep_callback(iris_substep_type_t type, int index, int total)
 }
 
 /* Track phase timing (wall-clock) */
-static struct timeval cli_phase_start_tv;
+static double cli_phase_start_ms;
 static const char *cli_current_phase = NULL;
 
 /* Called at phase boundaries (encoding text, decoding image, etc.) */
@@ -127,7 +127,7 @@ static void cli_phase_callback(const char *phase, int done) {
 
         /* Phase starting */
         cli_current_phase = phase;
-        gettimeofday(&cli_phase_start_tv, NULL);
+        cli_phase_start_ms = iris_time_ms();
 
         /* Capitalize first letter for display */
         char display[64];
@@ -141,10 +141,7 @@ static void cli_phase_callback(const char *phase, int done) {
         fflush(stderr);
     } else {
         /* Phase finished */
-        struct timeval now;
-        gettimeofday(&now, NULL);
-        double elapsed = (now.tv_sec - cli_phase_start_tv.tv_sec) +
-                         (now.tv_usec - cli_phase_start_tv.tv_usec) / 1000000.0;
+        double elapsed = (iris_time_ms() - cli_phase_start_ms) / 1000.0;
         fprintf(stderr, " done (%.1fs)\n", elapsed);
         cli_current_phase = NULL;
     }
@@ -182,17 +179,14 @@ static void cli_finish_progress(void) {
  * Timing Helper (wall-clock time)
  * ======================================================================== */
 
-static struct timeval timer_start_tv;
+static double timer_start_ms;
 
 static void timer_begin(void) {
-    gettimeofday(&timer_start_tv, NULL);
+    timer_start_ms = iris_time_ms();
 }
 
 static double timer_end(void) {
-    struct timeval now;
-    gettimeofday(&now, NULL);
-    return (now.tv_sec - timer_start_tv.tv_sec) +
-           (now.tv_usec - timer_start_tv.tv_usec) / 1000000.0;
+    return (iris_time_ms() - timer_start_ms) / 1000.0;
 }
 
 /* ========================================================================
@@ -384,7 +378,7 @@ int main(int argc, char *argv[]) {
     if (output_level != OUTPUT_QUIET) {
 #ifdef USE_METAL
         if (iris_metal_available()) {
-            long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+            long ncpu = iris_cpu_count();
             char cpu_brand[128] = "Apple Silicon";
             size_t len = sizeof(cpu_brand);
             sysctlbyname("machdep.cpu.brand_string", cpu_brand, &len, NULL, 0);
@@ -396,7 +390,7 @@ int main(int argc, char *argv[]) {
             char cpu_brand[128] = "Apple Silicon";
             size_t len = sizeof(cpu_brand);
             sysctlbyname("machdep.cpu.brand_string", cpu_brand, &len, NULL, 0);
-            long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+            long ncpu = iris_cpu_count();
             fprintf(stderr, "BLAS: Accelerate | %s | %ld cores\n", cpu_brand, ncpu);
             if (blas_threads > 0)
                 fprintf(stderr, "Warning: --blas-threads ignored (Accelerate manages threading automatically)\n");
@@ -551,8 +545,7 @@ int main(int argc, char *argv[]) {
 
     /* Generate image */
     iris_image *output = NULL;
-    struct timeval total_start_tv;
-    gettimeofday(&total_start_tv, NULL);
+    double total_start_ms = iris_time_ms();
 
     if (debug_py) {
         /* ============== Debug mode: use Python inputs ============== */
@@ -690,10 +683,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    struct timeval total_end_tv;
-    gettimeofday(&total_end_tv, NULL);
-    double total_time = (total_end_tv.tv_sec - total_start_tv.tv_sec) +
-                        (total_end_tv.tv_usec - total_start_tv.tv_usec) / 1000000.0;
+    double total_time = (iris_time_ms() - total_start_ms) / 1000.0;
     LOG_VERBOSE("Generated in %.1fs total\n", total_time);
     LOG_VERBOSE("  Output: %dx%d, %d channels\n",
                 output->width, output->height, output->channels);
@@ -718,10 +708,7 @@ int main(int argc, char *argv[]) {
     }
 
     /* Print total time (always, unless quiet) */
-    struct timeval final_tv;
-    gettimeofday(&final_tv, NULL);
-    double total_time_final = (final_tv.tv_sec - total_start_tv.tv_sec) +
-                              (final_tv.tv_usec - total_start_tv.tv_usec) / 1000000.0;
+    double total_time_final = (iris_time_ms() - total_start_ms) / 1000.0;
     LOG_NORMAL("Total generation time: %.1f seconds\n", load_time + total_time_final);
 
     /* Cleanup */

@@ -118,7 +118,7 @@ dl() {
             echo "    https://huggingface.co/$ORG/$REPO"
             echo "  - The repository name may not exist (check spelling)"
         fi
-        exit 1
+        echo exit 1
     fi
 }
 

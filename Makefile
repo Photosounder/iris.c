@@ -9,20 +9,21 @@ LDFLAGS = -lm
 # Platform detection
 UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
+IS_WINDOWS := $(findstring MINGW,$(UNAME_S))$(findstring MSYS,$(UNAME_S))
 
 # Source files
-SRCS = iris.c iris_kernels.c iris_tokenizer.c iris_vae.c iris_transformer_flux.c iris_transformer_zimage.c iris_sample.c iris_image.c jpeg.c iris_safetensors.c iris_qwen3.c iris_qwen3_tokenizer.c terminals.c
+SRCS = iris.c iris_kernels.c iris_tokenizer.c iris_vae.c iris_transformer_flux.c iris_transformer_zimage.c iris_sample.c iris_image.c jpeg.c iris_safetensors.c iris_qwen3.c iris_qwen3_tokenizer.c terminals.c iris_platform.c
 OBJS = $(SRCS:.c=.o)
 CLI_SRCS = iris_cli.c linenoise.c embcache.c
 CLI_OBJS = $(CLI_SRCS:.c=.o)
 MAIN = main.c
-TARGET = iris
+TARGET = iris$(if $(IS_WINDOWS),.exe,)
 LIB = libiris.a
 
 # Debug build flags
 DEBUG_CFLAGS = -Wall -Wextra -g -O0 -DDEBUG -fsanitize=address
 
-.PHONY: all clean debug lib install info test pngtest help generic blas mps
+.PHONY: all clean debug lib install info test pngtest help generic blas mps windows
 .NOTPARALLEL: mps
 
 # Default: show available targets
@@ -34,10 +35,14 @@ help:
 	@echo "Choose a backend:"
 	@echo "  make generic  - Pure C, no dependencies (slow)"
 	@echo "  make blas     - With BLAS acceleration (~30x faster)"
+ifeq ($(IS_WINDOWS),)
 ifeq ($(UNAME_S),Darwin)
 ifeq ($(UNAME_M),arm64)
 	@echo "  make mps      - Apple Silicon with Metal GPU (fastest)"
 endif
+endif
+else
+	@echo "  make windows  - Pure C Windows build (same as make generic)"
 endif
 	@echo ""
 	@echo "Other targets:"
@@ -58,12 +63,17 @@ generic: clean $(TARGET)
 	@echo "Built with GENERIC backend (pure C, no BLAS)"
 	@echo "This will be slow but has zero dependencies."
 
+windows: generic
+
 # =============================================================================
 # Backend: blas (Accelerate on macOS, OpenBLAS on Linux)
 # =============================================================================
 ifeq ($(UNAME_S),Darwin)
 blas: CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DACCELERATE_NEW_LAPACK
 blas: LDFLAGS += -framework Accelerate
+else ifneq ($(IS_WINDOWS),)
+blas: CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DUSE_OPENBLAS -I/ucrt64/include/openblas
+blas: LDFLAGS += -lopenblas -lpthread
 else
 blas: CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DUSE_OPENBLAS -I/usr/include/openblas
 blas: LDFLAGS += -lopenblas
@@ -120,7 +130,7 @@ lib: $(LIB)
 $(LIB): $(OBJS)
 	ar rcs $@ $^
 
-%.o: %.c iris.h iris_kernels.h
+%.o: %.c iris.h iris_kernels.h iris_platform.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # Debug build
@@ -139,12 +149,13 @@ test-quick:
 
 pngtest:
 	@echo "Running PNG compression compare test..."
-	@$(CC) $(CFLAGS_BASE) -I. png_compare.c iris_image.c -lm -o /tmp/iris_png_compare
+	@$(CC) $(CFLAGS_BASE) -I. png_compare.c iris_image.c jpeg.c -lm -o /tmp/iris_png_compare
 	@/tmp/iris_png_compare images/woman_with_sunglasses.png images/woman_with_sunglasses_compressed2.png
 	@/tmp/iris_png_compare images/cat_uncompressed.png images/cat_compressed.png
 	@rm -f /tmp/iris_png_compare
 	@echo "PNG TEST PASSED"
 
+ifeq ($(IS_WINDOWS),)
 install: $(TARGET) $(LIB)
 	install -d /usr/local/bin
 	install -d /usr/local/lib
@@ -153,6 +164,10 @@ install: $(TARGET) $(LIB)
 	install -m 644 $(LIB) /usr/local/lib/
 	install -m 644 iris.h /usr/local/include/
 	install -m 644 iris_kernels.h /usr/local/include/
+else
+install: $(TARGET) $(LIB)
+	@echo "Windows build complete: $(TARGET) and $(LIB)"
+endif
 
 clean:
 	rm -f $(OBJS) $(CLI_OBJS) *.mps.o iris_metal.o main.o $(TARGET) $(LIB)
@@ -164,6 +179,7 @@ info:
 	@echo ""
 	@echo "Available backends for this platform:"
 	@echo "  generic - Pure C (always available)"
+ifeq ($(IS_WINDOWS),)
 ifeq ($(UNAME_S),Darwin)
 	@echo "  blas    - Apple Accelerate"
 ifeq ($(UNAME_M),arm64)
@@ -171,6 +187,9 @@ ifeq ($(UNAME_M),arm64)
 endif
 else
 	@echo "  blas    - OpenBLAS (requires libopenblas-dev)"
+endif
+else
+	@echo "  blas    - OpenBLAS (requires OpenBLAS)"
 endif
 
 # =============================================================================
@@ -192,3 +211,4 @@ iris_cli.o: iris_cli.c iris_cli.h iris.h iris_qwen3.h embcache.h linenoise.h ter
 linenoise.o: linenoise.c linenoise.h
 embcache.o: embcache.c embcache.h
 main.o: main.c iris.h iris_kernels.h iris_cli.h terminals.h
+iris_platform.o: iris_platform.c iris_platform.h

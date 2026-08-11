@@ -9,6 +9,7 @@
 #include <string.h>
 #include <stdio.h>
 #include "embcache.h"
+#include "iris_platform.h"
 
 /* ========================================================================
  * Hash Function (FNV-1a)
@@ -162,7 +163,7 @@ void emb_cache_store(const char *prompt, const float *embedding, int num_element
     emb_cache_clear();
 
     /* Store new entry */
-    g_cache.prompt = strdup(prompt);
+    g_cache.prompt = iris_strdup(prompt);
     g_cache.hash = hash_string(prompt);
     g_cache.emb = emb_quantize_4bit(embedding, num_elements);
 

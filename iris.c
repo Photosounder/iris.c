@@ -642,6 +642,7 @@ float *iris_encode_text(iris_ctx *ctx, const char *prompt, int *out_seq_len) {
         /* Flux: return full padded sequence (512) */
         *out_seq_len = QWEN3_MAX_SEQ_LEN;
     }
+
     return embeddings;
 }
 

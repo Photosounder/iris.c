@@ -7,12 +7,12 @@
 
 #include "iris.h"
 #include "iris_kernels.h"
+#include "iris_platform.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <time.h>
-#include <sys/time.h>
 
 #ifdef USE_METAL
 #include "iris_metal.h"
@@ -20,9 +20,8 @@
 
 /* Timing utilities for performance analysis - use wall-clock time */
 static double get_time_ms(void) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
+    /* Use the platform timer implementation for this measurement. */
+    return iris_time_ms();
 }
 
 /* Cumulative timing for denoising breakdown */
@@ -198,15 +197,9 @@ float *iris_schedule_zimage(int num_steps, int image_seq_len) {
     float *schedule = (float *)malloc((num_steps + 1) * sizeof(float));
     const float shift = 3.0f;
     const float sigma_max = 1.0f;
-    const float sigma_train_min = 1.0f / 1000.0f;  /* num_train_timesteps=1000 */
-    const float sigma_min = shift * sigma_train_min /
-                            (1.0f + (shift - 1.0f) * sigma_train_min);
-
-    /* Diffusers set_timesteps(): linspace(sigma_max, sigma_min, num_steps),
-     * then apply static shift one more time. */
+    /* Match the reference scheduler's explicitly configured zero minimum */
     for (int i = 0; i < num_steps; i++) {
-        float u = (num_steps > 1) ? (float)i / (float)(num_steps - 1) : 0.0f;
-        float raw = sigma_max + (sigma_min - sigma_max) * u;
+        float raw = sigma_max - (float)i / (float)num_steps;
         schedule[i] = shift * raw / (1.0f + (shift - 1.0f) * raw);
     }
     /* Diffusers appends terminal sigma=0 (invert_sigmas=False). */
