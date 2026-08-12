@@ -67,6 +67,10 @@ const void *safetensors_data(const safetensors_file_t *sf, const safetensor_t *t
  * Handles conversion from F16/BF16 */
 float *safetensors_get_f32(const safetensors_file_t *sf, const safetensor_t *t);
 
+/* Convert tensor data into caller-provided float32 storage */
+int safetensors_get_f32_into(const safetensors_file_t *sf, const safetensor_t *t,
+                             float *out, size_t out_elements);
+
 /* Get tensor data as raw bf16 array (allocates, caller must free)
  * Only works for BF16 tensors. Returns NULL for other dtypes. */
 uint16_t *safetensors_get_bf16(const safetensors_file_t *sf, const safetensor_t *t);

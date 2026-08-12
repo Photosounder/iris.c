@@ -437,15 +437,39 @@ static float f16_to_f32(uint16_t f16) {
  * element-wise. The caller owns the returned buffer. This is the main
  * entry point for loading individual weights during model initialization. */
 float *safetensors_get_f32(const safetensors_file_t *sf, const safetensor_t *t) {
-    int64_t n = safetensor_numel(t);
+    int64_t n;
+
+    /* Validate the source tensor before reading its shape */
+    if (!sf || !t) return NULL;
+    n = safetensor_numel(t);
+    if (n <= 0) return NULL;
     float *out = malloc(n * sizeof(float));
     if (!out) return NULL;
 
-    const void *data = safetensors_data(sf, t);
+    /* Fill the newly allocated result through the reusable conversion routine */
+    if (!safetensors_get_f32_into(sf, t, out, (size_t)n)) {
+        free(out);
+        return NULL;
+    }
+    return out;
+}
 
+int safetensors_get_f32_into(const safetensors_file_t *sf, const safetensor_t *t,
+                             float *out, size_t out_elements) {
+    int64_t n;
+    const void *data;
+
+    /* Validate the destination before reading tensor metadata */
+    if (!sf || !t || !out) return 0;
+    n = safetensor_numel(t);
+    if (n <= 0 || (size_t)n > out_elements) return 0;
+    data = safetensors_data(sf, t);
+    if (!data) return 0;
+
+    /* Convert the mapped tensor into the caller-owned workspace */
     switch (t->dtype) {
         case DTYPE_F32:
-            memcpy(out, data, n * sizeof(float));
+        memcpy(out, data, n * sizeof(float));
             break;
 
         case DTYPE_F16: {
@@ -466,11 +490,10 @@ float *safetensors_get_f32(const safetensors_file_t *sf, const safetensor_t *t) 
 
         default:
             fprintf(stderr, "safetensors_get_f32: unsupported dtype\n");
-            free(out);
-            return NULL;
+            return 0;
     }
 
-    return out;
+    return 1;
 }
 
 int safetensor_is_bf16(const safetensor_t *t) {

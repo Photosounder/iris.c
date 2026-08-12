@@ -114,11 +114,50 @@ typedef struct iris_vae {
     float *post_quant_conv_weight;  /* [z_ch, z_ch, 1, 1] - decoder */
     float *post_quant_conv_bias;    /* [z_ch] */
 
-    /* Working memory (allocated for max image size) */
+    /* Working memory (grown for the requested image size) */
     int max_h, max_w;
     float *work1, *work2, *work3;
-    size_t work_size;
+    size_t work_size, work3_size;
 } iris_vae_t;
+
+/* Grow VAE scratch buffers to the dimensions used by the current operation */
+static int vae_ensure_workspace(iris_vae_t *vae, int batch, int H, int W) {
+    /* Validate the requested dimensions */
+    if (!vae || batch <= 0 || H <= 0 || W <= 0 || H > vae->max_h || W > vae->max_w)
+        return -1;
+
+    /* Compute the main buffer size at full resolution */
+    size_t pixels = (size_t)batch * (size_t)H * (size_t)W;
+    size_t main_size = pixels * (size_t)vae->base_channels * sizeof(float);
+
+    /* Compute the largest scratch size used by a residual block */
+    size_t scratch_size = main_size * 3;
+    size_t padded_size = (size_t)batch * (size_t)(H + 1) * (size_t)(W + 1) *
+                         (size_t)vae->base_channels * sizeof(float);
+    if (scratch_size < padded_size)
+        scratch_size = padded_size;
+
+    /* Grow the two main buffers together when needed */
+    if (!vae->work1 || !vae->work2 || vae->work_size < main_size) {
+        float *work1 = (float *)realloc(vae->work1, main_size);
+        if (!work1) return -1;
+        vae->work1 = work1;
+        float *work2 = (float *)realloc(vae->work2, main_size);
+        if (!work2) return -1;
+        vae->work2 = work2;
+        vae->work_size = main_size;
+    }
+
+    /* Grow the residual and padding scratch buffer when needed */
+    if (!vae->work3 || vae->work3_size < scratch_size) {
+        float *work3 = (float *)realloc(vae->work3, scratch_size);
+        if (!work3) return -1;
+        vae->work3 = work3;
+        vae->work3_size = scratch_size;
+    }
+
+    return 0;
+}
 
 /* Forward declarations */
 void iris_vae_free(iris_vae_t *vae);
@@ -336,6 +375,10 @@ static int attnblock_forward(float *out, const float *x,
 float *iris_vae_encode(iris_vae_t *vae, const float *img,
                        int batch, int H, int W,
                        int *out_h, int *out_w) {
+    /* Allocate workspace for the requested input dimensions */
+    if (vae_ensure_workspace(vae, batch, H, W) != 0)
+        return NULL;
+
     /*
      * Encoder path:
      * [B, 3, H, W] -> conv_in -> down_blocks -> mid_block -> norm -> conv_out
@@ -734,6 +777,10 @@ static iris_image *vae_decode_gpu(iris_vae_t *vae, const float *latent,
  * falling back to CPU on failure. */
 iris_image *iris_vae_decode(iris_vae_t *vae, const float *latent,
                             int batch, int latent_h, int latent_w) {
+    /* Allocate workspace for the requested output dimensions */
+    if (vae_ensure_workspace(vae, batch, latent_h * 16, latent_w * 16) != 0)
+        return NULL;
+
 #ifdef USE_METAL
     /* Try GPU-resident path first (eliminates CPU<->GPU round-trips per conv) */
     if (iris_metal_available()) {
@@ -1071,16 +1118,6 @@ iris_vae_t *iris_vae_load(FILE *f) {
     /* Read batch norm stats */
     vae->bn_mean = read_floats(f, vae->latent_channels);
     vae->bn_var = read_floats(f, vae->latent_channels);
-
-    /* Allocate working memory */
-    size_t max_spatial = (size_t)vae->max_h * vae->max_w;
-    size_t max_channels = mid_ch;  /* 512 */
-    vae->work_size = 4 * max_channels * max_spatial * sizeof(float);
-    vae->work1 = (float *)malloc(vae->work_size);
-    vae->work2 = (float *)malloc(vae->work_size);
-    vae->work3 = (float *)malloc(vae->work_size);
-
-    if (!vae->work1 || !vae->work2 || !vae->work3) goto error;
 
     return vae;
 
@@ -1434,28 +1471,6 @@ iris_vae_t *iris_vae_load_safetensors_ex(safetensors_file_t *sf,
         vae->bn_mean = calloc(lc, sizeof(float));
         vae->bn_var = malloc(lc * sizeof(float));
         for (int i = 0; i < lc; i++) vae->bn_var[i] = 1.0f;
-    }
-
-    /* Allocate working memory
-     * The decoder upsamples from H/8 to full H resolution.
-     * At full resolution (level 0), we have base_channels (128) channels.
-     * work1/work2: hold main tensors, max 128 * H * W
-     * work3: used for resblock/attention ops, needs ~4x main buffer
-     *
-     * Memory per buffer = 4 * 128 * H * W = 512 * H * W floats
-     * For 1024x1024: ~2GB per buffer, ~6GB total working memory
-     * For 1792x1792: ~6GB per buffer, ~18GB total working memory
-     */
-    size_t max_spatial = (size_t)vae->max_h * vae->max_w;
-    size_t max_channels = vae->base_channels;  /* 128 at full resolution */
-    vae->work_size = 4 * max_channels * max_spatial * sizeof(float);
-    vae->work1 = malloc(vae->work_size);
-    vae->work2 = malloc(vae->work_size);
-    vae->work3 = malloc(vae->work_size);
-
-    if (!vae->work1 || !vae->work2 || !vae->work3) {
-        iris_vae_free(vae);
-        return NULL;
     }
 
     return vae;

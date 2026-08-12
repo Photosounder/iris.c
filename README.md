@@ -318,11 +318,18 @@ sudo dnf install openblas-devel
 
 ### Windows
 
-Windows builds use the native MinGW/UCRT toolchain. Install the MSYS2 UCRT64 environment with GCC and Make, open an **MSYS2 UCRT64** shell, then run:
+Windows builds use the native MinGW/UCRT toolchain. Install the MSYS2 UCRT64 environment with GCC and Make, open an **MSYS2 UCRT64** shell, and place the [CIT Allocator](https://github.com/antirez/CITAlloc) checkout beside the Iris checkout as `../CITAlloc`. Then run:
 
 ```bash
 make windows       # Pure C build with no external runtime dependency
 # or: make blas    # OpenBLAS acceleration, if OpenBLAS is installed
+# or: make vulkan  # Vulkan compute acceleration
+```
+
+The Windows builds use CIT Allocator for the process heap, matching the integration used by Spacewar. If CITAlloc is elsewhere, override its include directory:
+
+```bash
+make windows CITA_INCLUDE=/c/path/to/CITAlloc
 ```
 
 The executable is `iris.exe`. Windows uses native file mappings for the default memory-mapped weight mode, and interactive mode falls back to the Windows console line editor and history file. The Python model downloader works from PowerShell or an MSYS2 shell:

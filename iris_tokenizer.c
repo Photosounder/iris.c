@@ -18,7 +18,7 @@
 
 /* Hash table entry for vocabulary lookup */
 typedef struct {
-    char *token;
+    const char *token;
     int id;
 } vocab_entry_t;
 
@@ -81,7 +81,8 @@ static void vocab_hash_insert(vocab_entry_t *table, int hash_size,
         }
         h = (h + 1) % hash_size;
     }
-        table[h].token = iris_strdup(token);
+    /* Keep hash entries as non-owning references to vocabulary strings */
+    table[h].token = token;
     table[h].id = id;
 }
 
@@ -328,7 +329,7 @@ iris_tokenizer *iris_tokenizer_load(const char *path) {
         tok->hash_size = IRIS_VOCAB_HASH_SIZE;
 
     /* Allocate vocabulary */
-    tok->vocab = malloc(tok->vocab_size * sizeof(char *));
+    tok->vocab = calloc(tok->vocab_size, sizeof(char *));
     tok->vocab_hash = calloc(tok->hash_size, sizeof(vocab_entry_t));
     if (!tok->vocab || !tok->vocab_hash) goto error;
 
@@ -381,9 +382,6 @@ void iris_tokenizer_free(iris_tokenizer *tok) {
     }
 
     if (tok->vocab_hash) {
-        for (int i = 0; i < tok->hash_size; i++) {
-            free(tok->vocab_hash[i].token);
-        }
         free(tok->vocab_hash);
     }
 
@@ -526,7 +524,7 @@ iris_tokenizer *iris_tokenizer_create_simple(void) {
     tok->add_bos = 1;
     tok->add_eos = 1;
 
-    tok->vocab = malloc(tok->vocab_size * sizeof(char *));
+    tok->vocab = calloc(tok->vocab_size, sizeof(char *));
     tok->vocab_hash = calloc(tok->hash_size, sizeof(vocab_entry_t));
     if (!tok->vocab || !tok->vocab_hash) {
         iris_tokenizer_free(tok);
@@ -550,10 +548,10 @@ iris_tokenizer *iris_tokenizer_create_simple(void) {
     tok->vocab[258] = iris_strdup("<bos>");
     tok->vocab[259] = iris_strdup("<eos>");
 
-    vocab_hash_insert(tok->vocab_hash, tok->hash_size, "<pad>", 256);
-    vocab_hash_insert(tok->vocab_hash, tok->hash_size, "<unk>", 257);
-    vocab_hash_insert(tok->vocab_hash, tok->hash_size, "<bos>", 258);
-    vocab_hash_insert(tok->vocab_hash, tok->hash_size, "<eos>", 259);
+    vocab_hash_insert(tok->vocab_hash, tok->hash_size, tok->vocab[256], 256);
+    vocab_hash_insert(tok->vocab_hash, tok->hash_size, tok->vocab[257], 257);
+    vocab_hash_insert(tok->vocab_hash, tok->hash_size, tok->vocab[258], 258);
+    vocab_hash_insert(tok->vocab_hash, tok->hash_size, tok->vocab[259], 259);
 
     return tok;
 }

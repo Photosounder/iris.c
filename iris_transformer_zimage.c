@@ -94,9 +94,22 @@ typedef struct {
     uint16_t *ffn_w1_bf16;          /* [ffn_dim, dim] */
     uint16_t *ffn_w2_bf16;          /* [dim, ffn_dim] */
     uint16_t *ffn_w3_bf16;          /* [ffn_dim, dim] */
-    int bf16_host_released;         /* GPU cache owns the BF16 storage */
+    unsigned int bf16_mapped_mask;  /* Native BF16 pointers owned by safetensors mappings */
+    unsigned int bf16_cached_mask;  /* Converted BF16 matrices already uploaded to Vulkan */
+    unsigned int f32_mapped_mask;   /* F32 fallback pointers owned by safetensors mappings */
+    int bf16_host_released;         /* Temporary BF16 host buffers released after cache warmup */
 #endif
 } zi_block_t;
+
+#ifdef IRIS_ZIMAGE_GPU
+#define ZI_BF16_ATTN_Q   (1u << 0)
+#define ZI_BF16_ATTN_K   (1u << 1)
+#define ZI_BF16_ATTN_V   (1u << 2)
+#define ZI_BF16_ATTN_OUT (1u << 3)
+#define ZI_BF16_FFN_W1   (1u << 4)
+#define ZI_BF16_FFN_W2   (1u << 5)
+#define ZI_BF16_FFN_W3   (1u << 6)
+#endif
 
 /* Final layer weights */
 typedef struct {
@@ -151,6 +164,9 @@ typedef struct zi_transformer {
 
     /* CPU mmap mode: keep shard files open and use direct f32 pointers. */
     int mmap_f32_weights;
+    int mmap_bf16_weights;
+    float *load_f32_workspace;
+    uint16_t *load_bf16_workspace;
     safetensors_file_t *sf_files[ZI_MAX_SHARDS];
     int num_sf_files;
 
@@ -185,6 +201,10 @@ typedef struct zi_transformer {
 } zi_transformer_t;
 
 void iris_transformer_free_zimage(zi_transformer_t *tf);
+
+#ifdef IRIS_ZIMAGE_GPU
+static int zi_prepare_cpu_fallback(zi_transformer_t *tf);
+#endif
 
 static void zi_final_forward(float *out, const float *x, const zi_final_t *fl,
                              const float *t_emb, int seq, zi_transformer_t *tf);
@@ -291,14 +311,31 @@ static void zi_build_rope_table(float *cos_out, float *sin_out,
  * variant avoids allocating a new tensor each call, which matters when
  * running 30+ blocks per step. */
 static int zi_gpu_linear_into_f32(iris_gpu_tensor_t out, iris_gpu_tensor_t x,
-                                   const uint16_t *W_bf16, const float *W_f32,
+                                   const uint16_t *W_bf16, const void *bf16_cache_key,
+                                   const float *W_f32,
                                    int seq_len, int in_dim, int out_dim) {
     size_t n = (size_t)seq_len * (size_t)out_dim;
 
+#ifdef USE_VULKAN
+    /* Stream mapped F32 weights through reusable BF16 Vulkan buffers */
+    if (W_f32 && iris_gpu_linear_f32_stream_into(
+            out, x, W_f32, seq_len, in_dim, out_dim)) {
+        return 1;
+    }
+
+    /* Try the stable-key BF16 cache before the F32 path */
+    if (bf16_cache_key && iris_gpu_linear_bf16_into_key(
+            out, x, bf16_cache_key, W_bf16, seq_len, in_dim, out_dim)) {
+        return 1;
+    }
+#else
+    /* Try the pointer-key BF16 cache before the F32 path */
     if (W_bf16) {
         if (iris_gpu_linear_bf16_into(out, x, W_bf16, seq_len, in_dim, out_dim)) {
             return 1;
         }
+#endif
+    if (W_bf16) {
         iris_gpu_tensor_t tmp_bf16 = iris_gpu_linear_bf16(x, W_bf16, seq_len, in_dim, out_dim);
         if (tmp_bf16) {
             iris_gpu_copy_f32(out, tmp_bf16, n);
@@ -467,6 +504,8 @@ static void iris_warmup_bf16_zimage(zi_transformer_t *tf) {
     if (!tf || !tf->use_gpu) return;
     if (!iris_metal_available()) return;
 
+#ifndef USE_VULKAN
+    /* Keep the existing Metal-wide warmup behavior */
     size_t attn_elems = (size_t)tf->dim * tf->dim;
     size_t ffn_up_elems = (size_t)tf->ffn_dim * tf->dim;
     size_t ffn_down_elems = (size_t)tf->dim * tf->ffn_dim;
@@ -491,26 +530,6 @@ static void iris_warmup_bf16_zimage(zi_transformer_t *tf) {
             if (b->ffn_w1_bf16) all_cached &= iris_metal_warmup_bf16(b->ffn_w1_bf16, ffn_up_elems);
             if (b->ffn_w2_bf16) all_cached &= iris_metal_warmup_bf16(b->ffn_w2_bf16, ffn_down_elems);
             if (b->ffn_w3_bf16) all_cached &= iris_metal_warmup_bf16(b->ffn_w3_bf16, ffn_up_elems);
-        }
-    }
-
-#ifdef USE_VULKAN
-    /* Release duplicate CPU matrices after every GPU cache entry is ready */
-    if (all_cached) {
-        for (int g = 0; g < 3; g++) {
-            zi_block_t *blocks = groups[g];
-            if (!blocks) continue;
-            for (int i = 0; i < counts[g]; i++) {
-                zi_block_t *b = &blocks[i];
-                free(b->attn_q_weight_bf16);
-                free(b->attn_k_weight_bf16);
-                free(b->attn_v_weight_bf16);
-                free(b->attn_out_weight_bf16);
-                free(b->ffn_w1_bf16);
-                free(b->ffn_w2_bf16);
-                free(b->ffn_w3_bf16);
-                b->bf16_host_released = 1;
-            }
         }
     }
 #endif
@@ -876,9 +895,10 @@ static void zi_block_forward(float *x, const zi_block_t *block,
 /* Convert f32 array to bf16 (CPU-side, for weight conversion at load time).
  * Uses round-to-nearest-even for best accuracy.
  * Caller owns the returned buffer. */
-static uint16_t *zi_f32_to_bf16(const float *src, size_t n) {
-    uint16_t *dst = (uint16_t *)malloc(n * sizeof(uint16_t));
-    if (!dst) return NULL;
+static int zi_f32_to_bf16_into(uint16_t *dst, const float *src, size_t n) {
+    if (!dst || !src) return 0;
+
+    /* Convert the source array into caller-owned BF16 storage */
     for (size_t i = 0; i < n; i++) {
         uint32_t bits;
         memcpy(&bits, &src[i], 4);
@@ -886,6 +906,18 @@ static uint16_t *zi_f32_to_bf16(const float *src, size_t n) {
         uint32_t rounding_bias = 0x7FFF + ((bits >> 16) & 1);
         bits += rounding_bias;
         dst[i] = (uint16_t)(bits >> 16);
+    }
+    return 1;
+}
+
+static uint16_t *zi_f32_to_bf16(const float *src, size_t n) {
+    uint16_t *dst = (uint16_t *)malloc(n * sizeof(uint16_t));
+    if (!dst) return NULL;
+
+    /* Convert into the newly allocated BF16 array */
+    if (!zi_f32_to_bf16_into(dst, src, n)) {
+        free(dst);
+        return NULL;
     }
     return dst;
 }
@@ -979,13 +1011,16 @@ static int zi_block_forward_gpu(iris_gpu_tensor_t hidden_gpu,
 
         /* GPU: Project Q, K, and V separately because fused output is row-interleaved */
         if (!zi_gpu_linear_into_f32(scratch->q, scratch->norm,
-                                    block->attn_q_weight_bf16, block->attn_q_weight,
+                                    block->attn_q_weight_bf16,
+                                    &block->attn_q_weight_bf16, block->attn_q_weight,
                                     seq, dim, dim)) return 0;
         if (!zi_gpu_linear_into_f32(scratch->k, scratch->norm,
-                                    block->attn_k_weight_bf16, block->attn_k_weight,
+                                    block->attn_k_weight_bf16,
+                                    &block->attn_k_weight_bf16, block->attn_k_weight,
                                     seq, dim, dim)) return 0;
         if (!zi_gpu_linear_into_f32(scratch->v, scratch->norm,
-                                    block->attn_v_weight_bf16, block->attn_v_weight,
+                                    block->attn_v_weight_bf16,
+                                    &block->attn_v_weight_bf16, block->attn_v_weight,
                                     seq, dim, dim)) return 0;
 
         /* GPU: QK normalization */
@@ -1007,7 +1042,8 @@ static int zi_block_forward_gpu(iris_gpu_tensor_t hidden_gpu,
 
         /* GPU: Output projection */
         if (!zi_gpu_linear_into_f32(scratch->proj, scratch->attn_out,
-                                    block->attn_out_weight_bf16, block->attn_out_weight,
+                                    block->attn_out_weight_bf16,
+                                    &block->attn_out_weight_bf16, block->attn_out_weight,
                                     seq, dim, dim)) return 0;
 
         /* GPU: attn_norm2 + gated residual: x += gate_msa * norm2(proj) */
@@ -1026,16 +1062,19 @@ static int zi_block_forward_gpu(iris_gpu_tensor_t hidden_gpu,
 
         /* GPU: Project the two SwiGLU inputs separately because fused output is row-interleaved */
         if (!zi_gpu_linear_into_f32(scratch->gate_up, scratch->norm,
-                                    block->ffn_w1_bf16, block->ffn_w1,
+                                    block->ffn_w1_bf16,
+                                    &block->ffn_w1_bf16, block->ffn_w1,
                                     seq, dim, ffn_dim)) return 0;
         if (!zi_gpu_linear_into_f32(scratch->up, scratch->norm,
-                                    block->ffn_w3_bf16, block->ffn_w3,
+                                    block->ffn_w3_bf16,
+                                    &block->ffn_w3_bf16, block->ffn_w3,
                                     seq, dim, ffn_dim)) return 0;
         iris_gpu_silu_mul(scratch->gate_up, scratch->up, seq * ffn_dim);
 
         /* GPU: FFN down projection */
         if (!zi_gpu_linear_into_f32(scratch->down, scratch->gate_up,
-                                    block->ffn_w2_bf16, block->ffn_w2,
+                                    block->ffn_w2_bf16,
+                                    &block->ffn_w2_bf16, block->ffn_w2,
                                     seq, ffn_dim, dim)) return 0;
 
         /* GPU: ffn_norm2 + gated residual: x += gate_mlp * norm2(ffn_out) */
@@ -1052,13 +1091,16 @@ static int zi_block_forward_gpu(iris_gpu_tensor_t hidden_gpu,
 
         /* GPU: Project Q, K, and V separately because fused output is row-interleaved */
         if (!zi_gpu_linear_into_f32(scratch->q, scratch->norm,
-                                    block->attn_q_weight_bf16, block->attn_q_weight,
+                                    block->attn_q_weight_bf16,
+                                    &block->attn_q_weight_bf16, block->attn_q_weight,
                                     seq, dim, dim)) return 0;
         if (!zi_gpu_linear_into_f32(scratch->k, scratch->norm,
-                                    block->attn_k_weight_bf16, block->attn_k_weight,
+                                    block->attn_k_weight_bf16,
+                                    &block->attn_k_weight_bf16, block->attn_k_weight,
                                     seq, dim, dim)) return 0;
         if (!zi_gpu_linear_into_f32(scratch->v, scratch->norm,
-                                    block->attn_v_weight_bf16, block->attn_v_weight,
+                                    block->attn_v_weight_bf16,
+                                    &block->attn_v_weight_bf16, block->attn_v_weight,
                                     seq, dim, dim)) return 0;
 
         /* GPU: QK normalization */
@@ -1080,7 +1122,8 @@ static int zi_block_forward_gpu(iris_gpu_tensor_t hidden_gpu,
 
         /* GPU: Output projection */
         if (!zi_gpu_linear_into_f32(scratch->proj, scratch->attn_out,
-                                    block->attn_out_weight_bf16, block->attn_out_weight,
+                                    block->attn_out_weight_bf16,
+                                    &block->attn_out_weight_bf16, block->attn_out_weight,
                                     seq, dim, dim)) return 0;
 
         /* GPU: norm2(proj) + residual: x += norm2(attn_out) */
@@ -1093,14 +1136,17 @@ static int zi_block_forward_gpu(iris_gpu_tensor_t hidden_gpu,
                                seq, dim, ZI_NORM_EPS);
         /* GPU: Project the two SwiGLU inputs separately because fused output is row-interleaved */
         if (!zi_gpu_linear_into_f32(scratch->gate_up, scratch->norm,
-                                    block->ffn_w1_bf16, block->ffn_w1,
+                                    block->ffn_w1_bf16,
+                                    &block->ffn_w1_bf16, block->ffn_w1,
                                     seq, dim, ffn_dim)) return 0;
         if (!zi_gpu_linear_into_f32(scratch->up, scratch->norm,
-                                    block->ffn_w3_bf16, block->ffn_w3,
+                                    block->ffn_w3_bf16,
+                                    &block->ffn_w3_bf16, block->ffn_w3,
                                     seq, dim, ffn_dim)) return 0;
         iris_gpu_silu_mul(scratch->gate_up, scratch->up, seq * ffn_dim);
         if (!zi_gpu_linear_into_f32(scratch->down, scratch->gate_up,
-                                    block->ffn_w2_bf16, block->ffn_w2,
+                                    block->ffn_w2_bf16,
+                                    &block->ffn_w2_bf16, block->ffn_w2,
                                     seq, ffn_dim, dim)) return 0;
 
         /* GPU: ffn_norm2 + residual: x += norm2(ffn_out) */
@@ -1638,6 +1684,12 @@ float *iris_transformer_forward_zimage(zi_transformer_t *tf,
         if (result) return result;
         /* Fall back to CPU on GPU failure */
         fprintf(stderr, "Z-Image GPU path failed, falling back to CPU\n");
+        /* Reload F32 weights before entering the CPU attention implementation */
+        if (!tf->mmap_f32_weights && !zi_prepare_cpu_fallback(tf)) {
+            fprintf(stderr, "Z-Image CPU fallback unavailable after GPU failure\n");
+            return NULL;
+        }
+        tf->use_gpu = 0;
     }
 #endif
 
@@ -1954,12 +2006,104 @@ static int zi_all_tensors_f32(safetensors_file_t **files, int n_files) {
 }
 
 #ifdef IRIS_ZIMAGE_GPU
+/* Reload GPU-only large matrices as F32 so the CPU fallback has valid weights */
+static int zi_prepare_cpu_fallback(zi_transformer_t *tf) {
+    zi_block_t *groups[3] = {tf->noise_refiner, tf->context_refiner, tf->layers};
+    int counts[3] = {tf->n_refiner, tf->n_refiner, tf->n_layers};
+    const char *prefixes[3] = {"noise_refiner", "context_refiner", "layers"};
+    char name[256];
+
+    /* Require retained safetensors mappings before converting fallback weights */
+    if (!tf->sf_files[0] || tf->num_sf_files <= 0) return 0;
+
+    /* Require F32 shards because the CPU fallback maps the original matrices */
+    if (!zi_all_tensors_f32(tf->sf_files, tf->num_sf_files)) return 0;
+
+    /* Reuse mapped F32 matrix data without allocating a second transformer copy */
+    for (int g = 0; g < 3; g++) {
+        for (int i = 0; i < counts[g]; i++) {
+            zi_block_t *block = &groups[g][i];
+            snprintf(name, sizeof(name), "%s.%d.attention.to_q.weight", prefixes[g], i);
+            block->attn_q_weight = zi_get_tensor(tf->sf_files, tf->num_sf_files, name, 1);
+            if (!block->attn_q_weight) goto fallback_error;
+            block->f32_mapped_mask |= ZI_BF16_ATTN_Q;
+            snprintf(name, sizeof(name), "%s.%d.attention.to_k.weight", prefixes[g], i);
+            block->attn_k_weight = zi_get_tensor(tf->sf_files, tf->num_sf_files, name, 1);
+            if (!block->attn_k_weight) goto fallback_error;
+            block->f32_mapped_mask |= ZI_BF16_ATTN_K;
+            snprintf(name, sizeof(name), "%s.%d.attention.to_v.weight", prefixes[g], i);
+            block->attn_v_weight = zi_get_tensor(tf->sf_files, tf->num_sf_files, name, 1);
+            if (!block->attn_v_weight) goto fallback_error;
+            block->f32_mapped_mask |= ZI_BF16_ATTN_V;
+            snprintf(name, sizeof(name), "%s.%d.attention.to_out.0.weight", prefixes[g], i);
+            block->attn_out_weight = zi_get_tensor(tf->sf_files, tf->num_sf_files, name, 1);
+            if (!block->attn_out_weight) goto fallback_error;
+            block->f32_mapped_mask |= ZI_BF16_ATTN_OUT;
+
+            /* Load the three mapped FFN matrices needed by the CPU block path */
+            snprintf(name, sizeof(name), "%s.%d.feed_forward.w1.weight", prefixes[g], i);
+            block->ffn_w1 = zi_get_tensor(tf->sf_files, tf->num_sf_files, name, 1);
+            if (!block->ffn_w1) goto fallback_error;
+            block->f32_mapped_mask |= ZI_BF16_FFN_W1;
+            snprintf(name, sizeof(name), "%s.%d.feed_forward.w2.weight", prefixes[g], i);
+            block->ffn_w2 = zi_get_tensor(tf->sf_files, tf->num_sf_files, name, 1);
+            if (!block->ffn_w2) goto fallback_error;
+            block->f32_mapped_mask |= ZI_BF16_FFN_W2;
+            snprintf(name, sizeof(name), "%s.%d.feed_forward.w3.weight", prefixes[g], i);
+            block->ffn_w3 = zi_get_tensor(tf->sf_files, tf->num_sf_files, name, 1);
+            if (!block->ffn_w3) goto fallback_error;
+            block->f32_mapped_mask |= ZI_BF16_FFN_W3;
+        }
+    }
+
+    return 1;
+
+fallback_error:
+    /* Release partial F32 fallback weights before reporting failure */
+    for (int g = 0; g < 3; g++) {
+        for (int i = 0; i < counts[g]; i++) {
+            zi_block_t *block = &groups[g][i];
+            /* Release only heap-backed fields from a partial fallback */
+            if (!(block->f32_mapped_mask & ZI_BF16_ATTN_Q)) free(block->attn_q_weight);
+            if (!(block->f32_mapped_mask & ZI_BF16_ATTN_K)) free(block->attn_k_weight);
+            if (!(block->f32_mapped_mask & ZI_BF16_ATTN_V)) free(block->attn_v_weight);
+            if (!(block->f32_mapped_mask & ZI_BF16_ATTN_OUT)) free(block->attn_out_weight);
+            if (!(block->f32_mapped_mask & ZI_BF16_FFN_W1)) free(block->ffn_w1);
+            if (!(block->f32_mapped_mask & ZI_BF16_FFN_W2)) free(block->ffn_w2);
+            if (!(block->f32_mapped_mask & ZI_BF16_FFN_W3)) free(block->ffn_w3);
+            block->attn_q_weight = NULL;
+            block->attn_k_weight = NULL;
+            block->attn_v_weight = NULL;
+            block->attn_out_weight = NULL;
+            block->ffn_w1 = NULL;
+            block->ffn_w2 = NULL;
+            block->ffn_w3 = NULL;
+            block->f32_mapped_mask = 0;
+        }
+    }
+    return 0;
+}
+#endif
+
+#ifdef IRIS_ZIMAGE_GPU
+#ifdef USE_VULKAN
+static int zi_warmup_bf16_key(const void *cache_key, const uint16_t *weights,
+                              size_t num_elements);
+#endif
+
 /* Load a transformer matrix directly as BF16 without retaining a full F32 copy */
 static uint16_t *zi_get_bf16_tensor(safetensors_file_t **files, int n_files,
-                                    const char *name) {
+                                    const char *name, unsigned int *mapped_mask,
+                                    unsigned int mapped_bit,
+                                    float *f32_workspace,
+                                    size_t f32_workspace_elements,
+                                    uint16_t *bf16_workspace,
+                                    const void *cache_key,
+                                    unsigned int *cached_mask) {
     const safetensor_t *tensor = NULL;
     safetensors_file_t *file = NULL;
     int64_t elements;
+    float *f32;
 
     /* Locate the matrix and reuse an existing BF16 payload when available */
     for (int i = 0; i < n_files; i++) {
@@ -1971,38 +2115,109 @@ static uint16_t *zi_get_bf16_tensor(safetensors_file_t **files, int n_files,
     }
     if (!tensor || !file) return NULL;
 
-    /* Copy native BF16 data directly from the memory-mapped shard */
-    if (tensor->dtype == DTYPE_BF16)
-        return safetensors_get_bf16(file, tensor);
+    /* Reuse native BF16 data directly from the memory-mapped shard */
+    if (tensor->dtype == DTYPE_BF16) {
+        if (mapped_mask) *mapped_mask |= mapped_bit;
+        return safetensors_get_bf16_direct(file, tensor);
+    }
 
-    /* Convert one matrix at a time so F32 weights do not accumulate in RAM */
+    /* Determine the conversion size before selecting reusable storage */
     elements = safetensor_numel(tensor);
     if (elements <= 0) return NULL;
-    float *f32 = safetensors_get_f32(file, tensor);
+
+    /* Fill the early-allocated F32 workspace when this matrix fits */
+    if (f32_workspace && (size_t)elements <= f32_workspace_elements) {
+        if (!safetensors_get_f32_into(file, tensor, f32_workspace,
+                                      f32_workspace_elements))
+            return NULL;
+        f32 = f32_workspace;
+    } else {
+        /* Fall back to a private F32 allocation for an unexpectedly large matrix */
+        f32 = safetensors_get_f32(file, tensor);
+    }
     if (!f32) return NULL;
+
+    /* Upload through reusable BF16 workspace when Vulkan owns the converted matrix */
+#ifdef USE_VULKAN
+    if (bf16_workspace && (size_t)elements <= f32_workspace_elements &&
+        cache_key && cached_mask &&
+        zi_f32_to_bf16_into(bf16_workspace, f32, (size_t)elements) &&
+        zi_warmup_bf16_key(cache_key, bf16_workspace, (size_t)elements)) {
+        *cached_mask |= mapped_bit;
+        if (f32 != f32_workspace) free(f32);
+        return NULL;
+    }
+#endif
+
+    /* Convert the F32 values into a private BF16 array when reuse is unavailable */
     uint16_t *bf16 = zi_f32_to_bf16(f32, (size_t)elements);
-    free(f32);
+    if (f32 != f32_workspace) free(f32);
     return bf16;
+}
+#endif /* IRIS_ZIMAGE_GPU */
+
+#ifdef USE_VULKAN
+static int zi_warmup_bf16_key(const void *cache_key, const uint16_t *weights,
+                              size_t num_elements) {
+    /* Use the stable block field as the Vulkan cache key */
+    return iris_metal_warmup_bf16_key(cache_key, weights, num_elements);
 }
 #endif
 
 static int zi_load_block(zi_block_t *block, safetensors_file_t **files,
                           int n_files, const char *prefix, int has_modulation,
                           int dim, int ffn_dim, int use_gpu,
-                          int mmap_f32_weights) {
+                          int mmap_f32_weights, float *f32_workspace,
+                          size_t f32_workspace_elements,
+                          uint16_t *bf16_workspace) {
     char name[256];
+
+#ifndef IRIS_ZIMAGE_GPU
+    /* Mark GPU-only conversion storage unused in the generic build */
+    (void)f32_workspace;
+    (void)f32_workspace_elements;
+    (void)bf16_workspace;
+#endif
 
     /* Load large GPU matrices directly in their execution precision */
 #ifdef IRIS_ZIMAGE_GPU
-    if (use_gpu) {
+    if (use_gpu && !mmap_f32_weights) {
         snprintf(name, sizeof(name), "%s.attention.to_q.weight", prefix);
-        block->attn_q_weight_bf16 = zi_get_bf16_tensor(files, n_files, name);
+         block->attn_q_weight_bf16 = zi_get_bf16_tensor(files, n_files, name,
+                                                         &block->bf16_mapped_mask,
+                                                         ZI_BF16_ATTN_Q,
+                                                         f32_workspace,
+                                                         f32_workspace_elements,
+                                                         bf16_workspace,
+                                                         &block->attn_q_weight_bf16,
+                                                         &block->bf16_cached_mask);
         snprintf(name, sizeof(name), "%s.attention.to_k.weight", prefix);
-        block->attn_k_weight_bf16 = zi_get_bf16_tensor(files, n_files, name);
+         block->attn_k_weight_bf16 = zi_get_bf16_tensor(files, n_files, name,
+                                                         &block->bf16_mapped_mask,
+                                                         ZI_BF16_ATTN_K,
+                                                         f32_workspace,
+                                                         f32_workspace_elements,
+                                                         bf16_workspace,
+                                                         &block->attn_k_weight_bf16,
+                                                         &block->bf16_cached_mask);
         snprintf(name, sizeof(name), "%s.attention.to_v.weight", prefix);
-        block->attn_v_weight_bf16 = zi_get_bf16_tensor(files, n_files, name);
+         block->attn_v_weight_bf16 = zi_get_bf16_tensor(files, n_files, name,
+                                                         &block->bf16_mapped_mask,
+                                                         ZI_BF16_ATTN_V,
+                                                         f32_workspace,
+                                                         f32_workspace_elements,
+                                                         bf16_workspace,
+                                                         &block->attn_v_weight_bf16,
+                                                         &block->bf16_cached_mask);
         snprintf(name, sizeof(name), "%s.attention.to_out.0.weight", prefix);
-        block->attn_out_weight_bf16 = zi_get_bf16_tensor(files, n_files, name);
+         block->attn_out_weight_bf16 = zi_get_bf16_tensor(files, n_files, name,
+                                                         &block->bf16_mapped_mask,
+                                                         ZI_BF16_ATTN_OUT,
+                                                         f32_workspace,
+                                                         f32_workspace_elements,
+                                                         bf16_workspace,
+                                                         &block->attn_out_weight_bf16,
+                                                         &block->bf16_cached_mask);
     } else
 #endif
     {
@@ -2030,13 +2245,35 @@ static int zi_load_block(zi_block_t *block, safetensors_file_t **files,
 
     /* Load the three SwiGLU matrices directly as BF16 on the GPU path */
 #ifdef IRIS_ZIMAGE_GPU
-    if (use_gpu) {
+    if (use_gpu && !mmap_f32_weights) {
         snprintf(name, sizeof(name), "%s.feed_forward.w1.weight", prefix);
-        block->ffn_w1_bf16 = zi_get_bf16_tensor(files, n_files, name);
+         block->ffn_w1_bf16 = zi_get_bf16_tensor(files, n_files, name,
+                                                 &block->bf16_mapped_mask,
+                                                 ZI_BF16_FFN_W1,
+                                                 f32_workspace,
+                                                 f32_workspace_elements,
+                                                 bf16_workspace,
+                                                 &block->ffn_w1_bf16,
+                                                 &block->bf16_cached_mask);
         snprintf(name, sizeof(name), "%s.feed_forward.w2.weight", prefix);
-        block->ffn_w2_bf16 = zi_get_bf16_tensor(files, n_files, name);
+         block->ffn_w2_bf16 = zi_get_bf16_tensor(files, n_files, name,
+                                                 &block->bf16_mapped_mask,
+                                                 ZI_BF16_FFN_W2,
+                                                 f32_workspace,
+                                                 f32_workspace_elements,
+                                                 bf16_workspace,
+                                                 &block->ffn_w2_bf16,
+                                                 &block->bf16_cached_mask);
         snprintf(name, sizeof(name), "%s.feed_forward.w3.weight", prefix);
-        block->ffn_w3_bf16 = zi_get_bf16_tensor(files, n_files, name);
+         block->ffn_w3_bf16 = zi_get_bf16_tensor(files, n_files, name,
+                                                 &block->bf16_mapped_mask,
+                                                 ZI_BF16_FFN_W3,
+                                                 f32_workspace,
+                                                 f32_workspace_elements,
+                                                 bf16_workspace,
+                                                 &block->ffn_w3_bf16,
+                                                 &block->bf16_cached_mask);
+
     } else
 #endif
     {
@@ -2068,9 +2305,13 @@ static int zi_load_block(zi_block_t *block, safetensors_file_t **files,
     /* Validate the precision-specific large matrices and shared small weights */
 #ifdef IRIS_ZIMAGE_GPU
     if (use_gpu) {
-        if (!block->attn_q_weight_bf16 || !block->attn_k_weight_bf16 ||
-            !block->attn_v_weight_bf16 || !block->attn_out_weight_bf16 ||
-            !block->ffn_w1_bf16 || !block->ffn_w2_bf16 || !block->ffn_w3_bf16)
+        if ((!block->attn_q_weight && !block->attn_q_weight_bf16 && !(block->bf16_cached_mask & ZI_BF16_ATTN_Q)) ||
+            (!block->attn_k_weight && !block->attn_k_weight_bf16 && !(block->bf16_cached_mask & ZI_BF16_ATTN_K)) ||
+            (!block->attn_v_weight && !block->attn_v_weight_bf16 && !(block->bf16_cached_mask & ZI_BF16_ATTN_V)) ||
+            (!block->attn_out_weight && !block->attn_out_weight_bf16 && !(block->bf16_cached_mask & ZI_BF16_ATTN_OUT)) ||
+            (!block->ffn_w1 && !block->ffn_w1_bf16 && !(block->bf16_cached_mask & ZI_BF16_FFN_W1)) ||
+            (!block->ffn_w2 && !block->ffn_w2_bf16 && !(block->bf16_cached_mask & ZI_BF16_FFN_W2)) ||
+            (!block->ffn_w3 && !block->ffn_w3_bf16 && !(block->bf16_cached_mask & ZI_BF16_FFN_W3)))
             return 0;
     } else
 #endif
@@ -2084,6 +2325,69 @@ static int zi_load_block(zi_block_t *block, safetensors_file_t **files,
     if (has_modulation && (!block->adaln_weight || !block->adaln_bias)) {
         return 0;
     }
+
+#ifdef USE_VULKAN
+    /* Upload this block before loading the next block to bound CPU peak memory */
+    if (use_gpu) {
+        size_t attn_elems = (size_t)dim * dim;
+        size_t ffn_up_elems = (size_t)ffn_dim * dim;
+        size_t ffn_down_elems = (size_t)dim * ffn_dim;
+        int cached = 1;
+        if (block->attn_q_weight_bf16)
+            cached &= zi_warmup_bf16_key(&block->attn_q_weight_bf16,
+                                         block->attn_q_weight_bf16, attn_elems);
+        if (block->attn_k_weight_bf16)
+            cached &= zi_warmup_bf16_key(&block->attn_k_weight_bf16,
+                                         block->attn_k_weight_bf16, attn_elems);
+        if (block->attn_v_weight_bf16)
+            cached &= zi_warmup_bf16_key(&block->attn_v_weight_bf16,
+                                         block->attn_v_weight_bf16, attn_elems);
+        if (block->attn_out_weight_bf16)
+            cached &= zi_warmup_bf16_key(&block->attn_out_weight_bf16,
+                                         block->attn_out_weight_bf16, attn_elems);
+        if (block->ffn_w1_bf16)
+            cached &= zi_warmup_bf16_key(&block->ffn_w1_bf16,
+                                         block->ffn_w1_bf16, ffn_up_elems);
+        if (block->ffn_w2_bf16)
+            cached &= zi_warmup_bf16_key(&block->ffn_w2_bf16,
+                                         block->ffn_w2_bf16, ffn_down_elems);
+        if (block->ffn_w3_bf16)
+            cached &= zi_warmup_bf16_key(&block->ffn_w3_bf16,
+                                         block->ffn_w3_bf16, ffn_up_elems);
+        if (cached) {
+            /* Release only converted BF16 buffers; mapped data stays owned by the shard */
+            if (!(block->bf16_mapped_mask & ZI_BF16_ATTN_Q)) {
+                free(block->attn_q_weight_bf16);
+                block->attn_q_weight_bf16 = NULL;
+            }
+            if (!(block->bf16_mapped_mask & ZI_BF16_ATTN_K)) {
+                free(block->attn_k_weight_bf16);
+                block->attn_k_weight_bf16 = NULL;
+            }
+            if (!(block->bf16_mapped_mask & ZI_BF16_ATTN_V)) {
+                free(block->attn_v_weight_bf16);
+                block->attn_v_weight_bf16 = NULL;
+            }
+            if (!(block->bf16_mapped_mask & ZI_BF16_ATTN_OUT)) {
+                free(block->attn_out_weight_bf16);
+                block->attn_out_weight_bf16 = NULL;
+            }
+            if (!(block->bf16_mapped_mask & ZI_BF16_FFN_W1)) {
+                free(block->ffn_w1_bf16);
+                block->ffn_w1_bf16 = NULL;
+            }
+            if (!(block->bf16_mapped_mask & ZI_BF16_FFN_W2)) {
+                free(block->ffn_w2_bf16);
+                block->ffn_w2_bf16 = NULL;
+            }
+            if (!(block->bf16_mapped_mask & ZI_BF16_FFN_W3)) {
+                free(block->ffn_w3_bf16);
+                block->ffn_w3_bf16 = NULL;
+            }
+            block->bf16_host_released = 1;
+        }
+    }
+#endif
 
 #ifdef IRIS_ZIMAGE_GPU
     /* Keep GPU weights in their direct BF16 representation */
@@ -2099,17 +2403,29 @@ static int zi_load_block(zi_block_t *block, safetensors_file_t **files,
 
 static void zi_free_block(zi_block_t *block, int free_f32_weights) {
     if (free_f32_weights) {
-        free(block->attn_q_weight);
-        free(block->attn_k_weight);
-        free(block->attn_v_weight);
-        free(block->attn_out_weight);
+#ifdef IRIS_ZIMAGE_GPU
+        /* Release ordinary F32 weights while preserving mapped fallback views */
+        if (!(block->f32_mapped_mask & ZI_BF16_ATTN_Q)) free(block->attn_q_weight);
+        if (!(block->f32_mapped_mask & ZI_BF16_ATTN_K)) free(block->attn_k_weight);
+        if (!(block->f32_mapped_mask & ZI_BF16_ATTN_V)) free(block->attn_v_weight);
+        if (!(block->f32_mapped_mask & ZI_BF16_ATTN_OUT)) free(block->attn_out_weight);
         free(block->attn_norm_q);
         free(block->attn_norm_k);
         free(block->attn_norm1);
         free(block->attn_norm2);
+        if (!(block->f32_mapped_mask & ZI_BF16_FFN_W1)) free(block->ffn_w1);
+        if (!(block->f32_mapped_mask & ZI_BF16_FFN_W2)) free(block->ffn_w2);
+        if (!(block->f32_mapped_mask & ZI_BF16_FFN_W3)) free(block->ffn_w3);
+#else
+        /* Release ordinary F32 weights in the generic build */
+        free(block->attn_q_weight);
+        free(block->attn_k_weight);
+        free(block->attn_v_weight);
+        free(block->attn_out_weight);
         free(block->ffn_w1);
         free(block->ffn_w2);
         free(block->ffn_w3);
+#endif
         free(block->ffn_norm1);
         free(block->ffn_norm2);
         free(block->adaln_weight);
@@ -2118,13 +2434,14 @@ static void zi_free_block(zi_block_t *block, int free_f32_weights) {
 #ifdef IRIS_ZIMAGE_GPU
     /* Free CPU BF16 matrices only when the GPU cache does not own them */
     if (!block->bf16_host_released) {
-        free(block->attn_q_weight_bf16);
-        free(block->attn_k_weight_bf16);
-        free(block->attn_v_weight_bf16);
-        free(block->attn_out_weight_bf16);
-        free(block->ffn_w1_bf16);
-        free(block->ffn_w2_bf16);
-        free(block->ffn_w3_bf16);
+        /* Release only converted BF16 buffers; mapped native BF16 data belongs to the shard mapping */
+        if (!(block->bf16_mapped_mask & ZI_BF16_ATTN_Q)) free(block->attn_q_weight_bf16);
+        if (!(block->bf16_mapped_mask & ZI_BF16_ATTN_K)) free(block->attn_k_weight_bf16);
+        if (!(block->bf16_mapped_mask & ZI_BF16_ATTN_V)) free(block->attn_v_weight_bf16);
+        if (!(block->bf16_mapped_mask & ZI_BF16_ATTN_OUT)) free(block->attn_out_weight_bf16);
+        if (!(block->bf16_mapped_mask & ZI_BF16_FFN_W1)) free(block->ffn_w1_bf16);
+        if (!(block->bf16_mapped_mask & ZI_BF16_FFN_W2)) free(block->ffn_w2_bf16);
+        if (!(block->bf16_mapped_mask & ZI_BF16_FFN_W3)) free(block->ffn_w3_bf16);
     }
 #endif
 }
@@ -2269,12 +2586,36 @@ zi_transformer_t *zi_transformer_load_safetensors(const char *model_dir,
     }
 #endif
     /* BLAS/CPU fast-load mode: keep mmap files open and use direct f32 pointers. */
+#ifdef USE_VULKAN
+    /* Keep F32 shards mapped so Vulkan can stream one BF16 matrix at a time */
+    int mmap_f32_weights = zi_all_tensors_f32(files, n_files);
+#else
     int mmap_f32_weights = (!use_gpu && zi_all_tensors_f32(files, n_files));
+#endif
     tf->mmap_f32_weights = mmap_f32_weights;
     if (mmap_f32_weights) {
         if (iris_verbose)
             fprintf(stderr, "  Z-Image: CPU mmap mode enabled (zero-copy f32 weights)\n");
     }
+
+#ifdef IRIS_ZIMAGE_GPU
+    /* Reserve reusable conversion buffers before loading transformer blocks */
+    size_t load_workspace_elements = use_gpu
+        && !mmap_f32_weights
+        ? (size_t)tf->ffn_dim * dim
+        : 0;
+    if (load_workspace_elements) {
+        tf->load_f32_workspace = (float *)malloc(
+            load_workspace_elements * sizeof(float));
+        tf->load_bf16_workspace = (uint16_t *)malloc(
+            load_workspace_elements * sizeof(uint16_t));
+        if (!tf->load_f32_workspace || !tf->load_bf16_workspace) {
+            goto error;
+        }
+    }
+#else
+    size_t load_workspace_elements = 0;
+#endif
 
     /* Load timestep embedder */
     tf->t_emb_mlp0_weight = zi_get_tensor(files, n_files, "t_embedder.mlp.0.weight", mmap_f32_weights);
@@ -2316,7 +2657,9 @@ zi_transformer_t *zi_transformer_load_safetensors(const char *model_dir,
     for (int i = 0; i < n_refiner; i++) {
         snprintf(name, sizeof(name), "noise_refiner.%d", i);
         if (!zi_load_block(&tf->noise_refiner[i], files, n_files, name, 1,
-                           dim, tf->ffn_dim, use_gpu, mmap_f32_weights)) {
+                           dim, tf->ffn_dim, use_gpu, mmap_f32_weights,
+                           tf->load_f32_workspace, load_workspace_elements,
+                           tf->load_bf16_workspace)) {
             goto error;
         }
     }
@@ -2327,7 +2670,9 @@ zi_transformer_t *zi_transformer_load_safetensors(const char *model_dir,
     for (int i = 0; i < n_refiner; i++) {
         snprintf(name, sizeof(name), "context_refiner.%d", i);
         if (!zi_load_block(&tf->context_refiner[i], files, n_files, name, 0,
-                           dim, tf->ffn_dim, use_gpu, mmap_f32_weights)) {
+                           dim, tf->ffn_dim, use_gpu, mmap_f32_weights,
+                           tf->load_f32_workspace, load_workspace_elements,
+                           tf->load_bf16_workspace)) {
             goto error;
         }
     }
@@ -2338,10 +2683,28 @@ zi_transformer_t *zi_transformer_load_safetensors(const char *model_dir,
     for (int i = 0; i < n_layers; i++) {
         snprintf(name, sizeof(name), "layers.%d", i);
         if (!zi_load_block(&tf->layers[i], files, n_files, name, 1,
-                           dim, tf->ffn_dim, use_gpu, mmap_f32_weights)) {
+                           dim, tf->ffn_dim, use_gpu, mmap_f32_weights,
+                           tf->load_f32_workspace, load_workspace_elements,
+                           tf->load_bf16_workspace)) {
             goto error;
         }
     }
+
+#ifdef IRIS_ZIMAGE_GPU
+    /* Keep shard mappings alive while native BF16 weights are referenced by the GPU path */
+    if (use_gpu) {
+        zi_block_t *groups[3] = {tf->noise_refiner, tf->context_refiner, tf->layers};
+        int counts[3] = {tf->n_refiner, tf->n_refiner, tf->n_layers};
+        for (int g = 0; g < 3 && !tf->mmap_bf16_weights; g++) {
+            for (int i = 0; i < counts[g]; i++) {
+                if (groups[g][i].bf16_mapped_mask) {
+                    tf->mmap_bf16_weights = 1;
+                    break;
+                }
+            }
+        }
+    }
+#endif
 
     /* Load final layer */
     snprintf(name, sizeof(name), "all_final_layer.%d-1.adaLN_modulation.1.weight", patch_size);
@@ -2372,7 +2735,7 @@ zi_transformer_t *zi_transformer_load_safetensors(const char *model_dir,
     tf->max_seq = 0;
 
     /* Close safetensors files unless CPU mmap mode is active. */
-    if (!mmap_f32_weights) {
+    if (!mmap_f32_weights && !use_gpu && !tf->mmap_bf16_weights) {
         for (int f = 0; f < n_files; f++) {
             if (tf->sf_files[f]) {
                 safetensors_close(tf->sf_files[f]);
@@ -2381,6 +2744,14 @@ zi_transformer_t *zi_transformer_load_safetensors(const char *model_dir,
         }
         tf->num_sf_files = 0;
     }
+
+#ifdef IRIS_ZIMAGE_GPU
+    /* Release conversion buffers after all block weights have been uploaded */
+    free(tf->load_f32_workspace);
+    free(tf->load_bf16_workspace);
+    tf->load_f32_workspace = NULL;
+    tf->load_bf16_workspace = NULL;
+#endif
 
     if (iris_verbose) {
         fprintf(stderr, "  Z-Image transformer loaded: dim=%d, heads=%d, layers=%d+%d+%d, ffn=%d\n",
@@ -2401,6 +2772,14 @@ error:
 
 void iris_transformer_free_zimage(zi_transformer_t *tf) {
     if (!tf) return;
+
+#ifdef IRIS_ZIMAGE_GPU
+    /* Release conversion storage if loading stopped before normal cleanup */
+    free(tf->load_f32_workspace);
+    free(tf->load_bf16_workspace);
+    tf->load_f32_workspace = NULL;
+    tf->load_bf16_workspace = NULL;
+#endif
 
     int free_f32_weights = !tf->mmap_f32_weights;
 

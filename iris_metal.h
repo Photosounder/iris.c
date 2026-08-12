@@ -264,6 +264,21 @@ int iris_gpu_linear_bf16_into(iris_gpu_tensor_t out,
                               const uint16_t *W_bf16,
                               int seq_len, int in_dim, int out_dim);
 
+#ifdef USE_VULKAN
+/* Vulkan-only linear call with a stable cache key for temporary weights */
+int iris_gpu_linear_bf16_into_key(iris_gpu_tensor_t out,
+                                  iris_gpu_tensor_t x,
+                                  const void *cache_key,
+                                  const uint16_t *W_bf16,
+                                  int seq_len, int in_dim, int out_dim);
+
+/* Vulkan-only linear call that streams mapped F32 weights through reusable BF16 buffers */
+int iris_gpu_linear_f32_stream_into(iris_gpu_tensor_t out,
+                                    iris_gpu_tensor_t x,
+                                    const float *W_f32,
+                                    int seq_len, int in_dim, int out_dim);
+#endif
+
 /*
  * GPU linear with bf16 weights - outputs bf16 tensor for full bf16 pipeline.
  * Uses native MPSDataTypeBFloat16.
@@ -722,6 +737,13 @@ int iris_metal_shaders_available(void);
  * This converts bf16 weights to f16 and caches the result.
  */
 int iris_metal_warmup_bf16(const uint16_t *bf16_weights, size_t num_elements);
+
+#ifdef USE_VULKAN
+/* Warm up a BF16 buffer using stable metadata as its cache key */
+int iris_metal_warmup_bf16_key(const void *cache_key,
+                               const uint16_t *bf16_weights,
+                               size_t num_elements);
+#endif
 
 /*
  * Pre-warm the bf16 buffer cache for a weight tensor.

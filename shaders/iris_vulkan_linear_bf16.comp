@@ -6,7 +6,9 @@ layout(set = 0, binding = 0, std430) readonly buffer XBuffer { float x[]; };
 layout(set = 0, binding = 1, std430) readonly buffer WeightBuffer { uint weight[]; };
 layout(set = 0, binding = 2, std430) buffer OutputBuffer { float output_data[]; };
 
-layout(push_constant) uniform Push { uint p[3]; } pc;
+layout(push_constant) uniform Push { uint p[4]; } pc;
+shared float x_tile[16][16];
+shared float weight_tile[16][16];
 
 float load_bf16(uint index) {
     uint packed = weight[index >> 1];
@@ -15,16 +17,36 @@ float load_bf16(uint index) {
 }
 
 void main() {
-    uint row = gl_GlobalInvocationID.y;
+    uint local_row = gl_LocalInvocationID.y;
+    uint local_col = gl_LocalInvocationID.x;
+    uint row = pc.p[3] + gl_GlobalInvocationID.y;
     uint col = gl_GlobalInvocationID.x;
     uint rows = pc.p[0];
     uint inner = pc.p[1];
     uint cols = pc.p[2];
-    if (row >= rows || col >= cols) return;
 
     float sum = 0.0;
-    for (uint i = 0; i < inner; i++) {
-        sum += x[row * inner + i] * load_bf16(col * inner + i);
+    for (uint base = 0u; base < inner; base += 16u) {
+        uint x_index = base + local_col;
+        uint weight_index = base + local_col;
+
+        x_tile[local_row][local_col] =
+            row < rows && x_index < inner
+                ? x[row * inner + x_index]
+                : 0.0;
+
+        uint weight_col = gl_WorkGroupID.x * 16u + local_row;
+        weight_tile[local_row][local_col] =
+            weight_col < cols && weight_index < inner
+                ? load_bf16(weight_col * inner + weight_index)
+                : 0.0;
+        barrier();
+
+        for (uint i = 0u; i < 16u; i++)
+            sum += x_tile[local_row][i] * weight_tile[local_col][i];
+        barrier();
     }
-    output_data[row * cols + col] = sum;
+
+    if (row < rows && col < cols)
+        output_data[row * cols + col] = sum;
 }

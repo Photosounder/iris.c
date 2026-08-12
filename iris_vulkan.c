@@ -68,6 +68,9 @@ typedef struct {
     int batch_active;
     vk_cached_buffer_t *cache;
     size_t memory_used;
+    iris_gpu_tensor_impl_t *stream_weight;
+    iris_gpu_tensor_impl_t *stream_staging;
+    size_t stream_weight_bytes;
 } vk_context_t;
 
 static vk_context_t vk_ctx;
@@ -279,6 +282,7 @@ static void vk_tensor_destroy(iris_gpu_tensor_impl_t *tensor) {
     vk_tensor_unmap(tensor);
     if (tensor->buffer) vkDestroyBuffer(vk_ctx.device, tensor->buffer, NULL);
     if (tensor->memory) vkFreeMemory(vk_ctx.device, tensor->memory, NULL);
+    if (vk_ctx.memory_used >= tensor->bytes) vk_ctx.memory_used -= tensor->bytes;
     free(tensor);
 }
 
@@ -504,22 +508,25 @@ static int vk_copy_region(iris_gpu_tensor_impl_t *dst, size_t dst_offset,
     return vk_end_if_temporary(temporary_batch);
 }
 
-static iris_gpu_tensor_impl_t *vk_cached(const void *host_ptr, size_t bytes,
-                                          int is_f16) {
+static iris_gpu_tensor_impl_t *vk_cached_key(const void *cache_key,
+                                              const void *host_ptr,
+                                              size_t bytes, int is_f16) {
     /* Refuse new cached buffers once Vulkan has reported device loss */
-    if (!vk_ready() || !host_ptr) return NULL;
+    if (!vk_ready() || !cache_key) return NULL;
     for (vk_cached_buffer_t *entry = vk_ctx.cache; entry; entry = entry->next) {
-        if (entry->host_ptr == host_ptr && entry->bytes == bytes &&
+        if (entry->host_ptr == cache_key && entry->bytes == bytes &&
             entry->is_f16 == is_f16) {
             void *mapped = NULL;
             /* Refresh mutable host arrays before reusing their cached buffer */
-            if (!is_f16 && vk_tensor_map(entry->tensor, &mapped)) {
+            if (!is_f16 && host_ptr && vk_tensor_map(entry->tensor, &mapped)) {
                 memcpy(mapped, host_ptr, bytes);
                 vk_tensor_unmap(entry->tensor);
             }
             return entry->tensor;
         }
     }
+    /* Reject a cache miss when the caller has already released its host copy */
+    if (!host_ptr) return NULL;
     iris_gpu_tensor_impl_t *tensor = NULL;
     if (is_f16 && !vk_ctx.batch_active)
         tensor = vk_tensor_alloc_device_local_bytes(bytes, is_f16, 1);
@@ -564,13 +571,83 @@ static iris_gpu_tensor_impl_t *vk_cached(const void *host_ptr, size_t bytes,
         vk_tensor_destroy(tensor);
         return NULL;
     }
-    entry->host_ptr = host_ptr;
+    entry->host_ptr = cache_key;
     entry->bytes = bytes;
     entry->is_f16 = is_f16;
     entry->tensor = tensor;
     entry->next = vk_ctx.cache;
     vk_ctx.cache = entry;
     return tensor;
+}
+
+static iris_gpu_tensor_impl_t *vk_cached(const void *host_ptr, size_t bytes,
+                                          int is_f16) {
+    /* Use the payload address as the default cache key */
+    return vk_cached_key(host_ptr, host_ptr, bytes, is_f16);
+}
+
+static int vk_stream_weight_prepare(size_t bytes) {
+    if (vk_ctx.stream_weight && vk_ctx.stream_staging &&
+        vk_ctx.stream_weight_bytes >= bytes)
+        return 1;
+
+    /* Replace undersized reusable streaming buffers between submitted kernels */
+    vk_tensor_destroy(vk_ctx.stream_weight);
+    vk_tensor_destroy(vk_ctx.stream_staging);
+    vk_ctx.stream_weight = NULL;
+    vk_ctx.stream_staging = NULL;
+    vk_ctx.stream_weight_bytes = 0;
+
+    /* Allocate one device-local weight buffer and one host-visible conversion buffer */
+    vk_ctx.stream_weight = vk_tensor_alloc_device_local_bytes(bytes, 1, 0);
+    vk_ctx.stream_staging = vk_tensor_alloc_bytes(bytes, 1, 0);
+    if (!vk_ctx.stream_weight || !vk_ctx.stream_staging ||
+        !vk_ctx.stream_staging->host_visible) {
+        vk_tensor_destroy(vk_ctx.stream_weight);
+        vk_tensor_destroy(vk_ctx.stream_staging);
+        vk_ctx.stream_weight = NULL;
+        vk_ctx.stream_staging = NULL;
+        return 0;
+    }
+    vk_ctx.stream_weight_bytes = bytes;
+    return 1;
+}
+
+static int vk_stream_weight_upload(const float *weights, size_t elements) {
+    size_t bytes = elements * sizeof(uint16_t);
+    if (!weights || !elements || !vk_stream_weight_prepare(bytes)) return 0;
+
+    /* Convert mapped F32 weights directly into the reusable host-visible buffer */
+    void *mapped = NULL;
+    if (!vk_tensor_map(vk_ctx.stream_staging, &mapped)) return 0;
+    uint16_t *bf16 = mapped;
+    for (size_t i = 0; i < elements; i++)
+        bf16[i] = vk_float_to_bf16(weights[i]);
+    vk_tensor_unmap(vk_ctx.stream_staging);
+
+    /* Upload the converted matrix before the reusable buffer is overwritten */
+    return vk_copy_region(vk_ctx.stream_weight, 0, vk_ctx.stream_staging, 0, bytes);
+}
+
+static int vk_linear_bf16_dispatch(iris_gpu_tensor_impl_t *out,
+                                    iris_gpu_tensor_impl_t *x,
+                                    iris_gpu_tensor_impl_t *weight,
+                                    int seq_len, int in_dim, int out_dim) {
+    iris_gpu_tensor_impl_t *buffers[3] = {x, weight, out};
+    const int row_chunk = 1024;
+
+    /* Split large projections into bounded submissions for the Windows watchdog */
+    for (int row_offset = 0; row_offset < seq_len; row_offset += row_chunk) {
+        int row_count = seq_len - row_offset;
+        if (row_count > row_chunk) row_count = row_chunk;
+        uint32_t push[4] = {(uint32_t)seq_len, (uint32_t)in_dim,
+                            (uint32_t)out_dim, (uint32_t)row_offset};
+        if (!vk_dispatch(VK_PIPE_LINEAR_BF16, buffers, 3, push, 4,
+                         ((uint32_t)out_dim + 15u) / 16u,
+                         ((uint32_t)row_count + 15u) / 16u, 1))
+            return 0;
+    }
+    return 1;
 }
 
 static int vk_load_spirv(const char *path, uint32_t **words, size_t *word_count) {
@@ -798,6 +875,15 @@ int iris_metal_warmup_bf16(const uint16_t *bf16_weights, size_t num_elements) {
     return vk_cached(bf16_weights, num_elements * sizeof(uint16_t), 1) != NULL;
 }
 
+int iris_metal_warmup_bf16_key(const void *cache_key,
+                               const uint16_t *bf16_weights,
+                               size_t num_elements) {
+    /* Upload a temporary BF16 buffer under a stable caller-owned key */
+    if (!cache_key || !bf16_weights || num_elements == 0 || !vk_ready()) return 0;
+    return vk_cached_key(cache_key, bf16_weights,
+                         num_elements * sizeof(uint16_t), 1) != NULL;
+}
+
 static void vk_clear_cache(void) {
     vk_cached_buffer_t *entry = vk_ctx.cache;
     while (entry) {
@@ -818,6 +904,12 @@ void iris_metal_cleanup(void) {
     /* Wait only while the device is known to be responsive */
     if (vk_ctx.device && !device_lost) vkDeviceWaitIdle(vk_ctx.device);
     vk_clear_cache();
+    /* Release reusable streamed-weight storage while the device is responsive */
+    vk_tensor_destroy(vk_ctx.stream_weight);
+    vk_tensor_destroy(vk_ctx.stream_staging);
+    vk_ctx.stream_weight = NULL;
+    vk_ctx.stream_staging = NULL;
+    vk_ctx.stream_weight_bytes = 0;
     if (vk_ctx.device && !device_lost) {
         for (int i = 0; i < VK_PIPE_COUNT; i++)
             if (vk_ctx.pipelines[i]) vkDestroyPipeline(vk_ctx.device, vk_ctx.pipelines[i], NULL);
@@ -968,17 +1060,38 @@ int iris_gpu_linear_bf16_into(iris_gpu_tensor_t out_tensor,
                               iris_gpu_tensor_t x_tensor,
                               const uint16_t *weights,
                               int seq_len, int in_dim, int out_dim) {
+    return iris_gpu_linear_bf16_into_key(out_tensor, x_tensor, weights, weights,
+                                         seq_len, in_dim, out_dim);
+}
+
+int iris_gpu_linear_bf16_into_key(iris_gpu_tensor_t out_tensor,
+                                  iris_gpu_tensor_t x_tensor,
+                                  const void *cache_key,
+                                  const uint16_t *weights,
+                                  int seq_len, int in_dim, int out_dim) {
     iris_gpu_tensor_impl_t *out = (iris_gpu_tensor_impl_t *)out_tensor;
     iris_gpu_tensor_impl_t *x = (iris_gpu_tensor_impl_t *)x_tensor;
-    if (!out || !x || !weights || !vk_ready() || out->is_f16 || x->is_f16) return 0;
-    iris_gpu_tensor_impl_t *weight = vk_cached(weights,
+    if (!out || !x || !cache_key || !vk_ready() || out->is_f16 || x->is_f16) return 0;
+    iris_gpu_tensor_impl_t *weight = vk_cached_key(cache_key, weights,
         (size_t)in_dim * out_dim * sizeof(uint16_t), 1);
     if (!weight) return 0;
-    iris_gpu_tensor_impl_t *buffers[3] = {x, weight, out};
-    uint32_t push[3] = {(uint32_t)seq_len, (uint32_t)in_dim, (uint32_t)out_dim};
-    return vk_dispatch(VK_PIPE_LINEAR_BF16, buffers, 3, push, 3,
-                       ((uint32_t)out_dim + 15u) / 16u,
-                       ((uint32_t)seq_len + 15u) / 16u, 1);
+    return vk_linear_bf16_dispatch(out, x, weight, seq_len, in_dim, out_dim);
+}
+
+int iris_gpu_linear_f32_stream_into(iris_gpu_tensor_t out_tensor,
+                                    iris_gpu_tensor_t x_tensor,
+                                    const float *weights,
+                                    int seq_len, int in_dim, int out_dim) {
+    iris_gpu_tensor_impl_t *out = (iris_gpu_tensor_impl_t *)out_tensor;
+    iris_gpu_tensor_impl_t *x = (iris_gpu_tensor_impl_t *)x_tensor;
+    size_t elements = (size_t)in_dim * out_dim;
+    if (!out || !x || !weights || !vk_ready() || out->is_f16 || x->is_f16)
+        return 0;
+
+    /* Convert and upload only the matrix needed by this projection */
+    if (!vk_stream_weight_upload(weights, elements)) return 0;
+    return vk_linear_bf16_dispatch(out, x, vk_ctx.stream_weight,
+                                   seq_len, in_dim, out_dim);
 }
 
 iris_gpu_tensor_t iris_gpu_linear_bf16(iris_gpu_tensor_t x,

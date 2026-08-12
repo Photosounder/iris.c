@@ -11,6 +11,17 @@ UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
 IS_WINDOWS := $(findstring MINGW,$(UNAME_S))$(findstring MSYS,$(UNAME_S))
 
+# CIT Allocator integration for Windows builds
+ifeq ($(IS_WINDOWS),)
+CITA_CFLAGS =
+CITA_OBJS =
+else
+CITA_INCLUDE ?= ../CITAlloc
+CITA_CFLAGS = -DIRIS_USE_CITA -I$(CITA_INCLUDE) -include iris_cita.h
+CITA_OBJS = cita_impl.o
+CITA_LDFLAGS = -luser32
+endif
+
 # Source files
 SRCS = iris.c iris_kernels.c iris_tokenizer.c iris_vae.c iris_transformer_flux.c iris_transformer_zimage.c iris_sample.c iris_image.c jpeg.c iris_safetensors.c iris_qwen3.c iris_qwen3_tokenizer.c terminals.c iris_platform.c
 OBJS = $(SRCS:.c=.o)
@@ -61,12 +72,12 @@ endif
 # =============================================================================
 # Backend: generic (pure C, no BLAS)
 # =============================================================================
-generic: CFLAGS = $(CFLAGS_BASE) -DGENERIC_BUILD
+generic: CFLAGS = $(CFLAGS_BASE) -DGENERIC_BUILD $(CITA_CFLAGS)
 generic: clean $(TARGET)
 	@echo ""
 	@echo "Built with GENERIC backend (pure C, no BLAS)"
 	@echo "This will be slow but has zero dependencies."
-
+    
 windows: generic
 
 # =============================================================================
@@ -76,7 +87,7 @@ ifeq ($(UNAME_S),Darwin)
 blas: CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DACCELERATE_NEW_LAPACK
 blas: LDFLAGS += -framework Accelerate
 else ifneq ($(IS_WINDOWS),)
-blas: CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DUSE_OPENBLAS -I/ucrt64/include/openblas
+blas: CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DUSE_OPENBLAS -I/ucrt64/include/openblas $(CITA_CFLAGS)
 blas: LDFLAGS += -lopenblas -lpthread
 else
 blas: CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DUSE_OPENBLAS -I/usr/include/openblas
@@ -89,8 +100,8 @@ blas: clean $(TARGET)
 # =============================================================================
 # Backend: vulkan compute
 # =============================================================================
-VULKAN_CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DUSE_OPENBLAS -DUSE_VULKAN -I/ucrt64/include/openblas
-VULKAN_LDFLAGS = -lm -lopenblas -lvulkan-1 -lpthread
+VULKAN_CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DUSE_OPENBLAS -DUSE_VULKAN -I/ucrt64/include/openblas $(CITA_CFLAGS)
+VULKAN_LDFLAGS = -lm -lopenblas -lvulkan-1 -lpthread $(CITA_LDFLAGS)
 
 vulkan: CFLAGS = $(VULKAN_CFLAGS)
 vulkan: LDFLAGS = $(VULKAN_LDFLAGS)
@@ -100,7 +111,7 @@ vulkan: clean vulkan-shaders vulkan-build
 
 vulkan-shaders: $(VULKAN_SHADER_BINS)
 
-vulkan-build: $(OBJS) $(CLI_OBJS) $(VULKAN_OBJS) main.o
+vulkan-build: $(OBJS) $(CLI_OBJS) $(VULKAN_OBJS) $(CITA_OBJS) main.o
 	$(CC) $(CFLAGS) -o $(TARGET) $^ $(LDFLAGS)
 
 shaders/%.comp.spv: shaders/%.comp
@@ -146,16 +157,19 @@ endif
 # =============================================================================
 # Build rules
 # =============================================================================
-$(TARGET): $(OBJS) $(CLI_OBJS) main.o
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+$(TARGET): $(OBJS) $(CLI_OBJS) $(CITA_OBJS) main.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(CITA_LDFLAGS)
 
 lib: $(LIB)
 
-$(LIB): $(OBJS)
+$(LIB): $(OBJS) $(CITA_OBJS)
 	ar rcs $@ $^
 
-%.o: %.c iris.h iris_kernels.h iris_platform.h
+%.o: %.c iris.h iris_kernels.h iris_platform.h iris_cita.h
 	$(CC) $(CFLAGS) -c -o $@ $<
+
+cita_impl.o: cita_impl.c iris_cita.h
+	$(CC) $(CFLAGS) -DIRIS_CITA_IMPLEMENTATION -c -o $@ $<
 
 # Debug build
 debug: CFLAGS = $(DEBUG_CFLAGS)
@@ -194,7 +208,7 @@ install: $(TARGET) $(LIB)
 endif
 
 clean:
-	rm -f $(OBJS) $(CLI_OBJS) $(VULKAN_OBJS) *.mps.o iris_metal.o main.o $(TARGET) $(LIB)
+	rm -f $(OBJS) $(CLI_OBJS) $(VULKAN_OBJS) $(CITA_OBJS) *.mps.o iris_metal.o main.o $(TARGET) $(LIB)
 	rm -f $(VULKAN_SHADER_BINS)
 	rm -f iris_shaders_source.h
 
