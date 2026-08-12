@@ -250,6 +250,8 @@ Done -> /tmp/iris-.../image-0003.png (ref $2)
 ```
 -m, --mmap            Memory-mapped weights (default, fastest on MPS)
     --no-mmap         Disable mmap, load all weights upfront
+    --transformer PATH Use a standalone transformer safetensors file
+    --gpu-friendly     Preserve desktop responsiveness during GPU work
     --no-license-info Suppress non-commercial license warning (9B model)
 -e, --embeddings PATH Load pre-computed text embeddings (advanced)
 -h, --help            Show help

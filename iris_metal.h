@@ -277,6 +277,15 @@ int iris_gpu_linear_f32_stream_into(iris_gpu_tensor_t out,
                                     iris_gpu_tensor_t x,
                                     const float *W_f32,
                                     int seq_len, int in_dim, int out_dim);
+
+/* Vulkan-only scaled E4M3FN projection from a streamed payload */
+int iris_gpu_linear_fp8_stream_into(iris_gpu_tensor_t out,
+                                    iris_gpu_tensor_t x,
+                                    const uint8_t *weights,
+                                    size_t weight_elements,
+                                    size_t weight_offset,
+                                    float weight_scale,
+                                    int seq_len, int in_dim, int out_dim);
 #endif
 
 /*
@@ -731,6 +740,9 @@ void iris_metal_rope_2d(float *x, const float *cos_freq, const float *sin_freq,
  */
 int iris_metal_shaders_available(void);
 
+/* Prefer desktop responsiveness over maximum GPU throughput */
+void iris_gpu_set_friendly_mode(int enable);
+
 /*
  * Pre-warm the bf16→f16 conversion cache for a weight tensor.
  * Call this during model loading to avoid conversion overhead during inference.
@@ -743,6 +755,12 @@ int iris_metal_warmup_bf16(const uint16_t *bf16_weights, size_t num_elements);
 int iris_metal_warmup_bf16_key(const void *cache_key,
                                const uint16_t *bf16_weights,
                                size_t num_elements);
+
+/* Warm up a raw FP8 payload in budgeted Vulkan device-local storage */
+int iris_metal_warmup_fp8(const uint8_t *weights, size_t num_elements);
+
+/* Return the number of raw FP8 bytes retained by the Vulkan cache */
+size_t iris_metal_fp8_cache_used(void);
 #endif
 
 /*

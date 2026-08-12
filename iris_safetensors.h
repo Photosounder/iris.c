@@ -14,7 +14,7 @@
 #include <stdint.h>
 
 /* Maximum number of tensors per file */
-#define SAFETENSORS_MAX_TENSORS 512
+#define SAFETENSORS_MAX_TENSORS 1024
 
 /* Tensor data types */
 typedef enum {
@@ -24,6 +24,7 @@ typedef enum {
     DTYPE_I32 = 3,
     DTYPE_I64 = 4,
     DTYPE_BOOL = 5,
+    DTYPE_F8_E4M3 = 6,
     DTYPE_UNKNOWN = -1
 } safetensor_dtype_t;
 
@@ -84,6 +85,9 @@ int safetensor_is_bf16(const safetensor_t *t);
 
 /* Get total number of elements in tensor */
 int64_t safetensor_numel(const safetensor_t *t);
+
+/* Decode one finite-numbers E4M3 byte */
+float safetensor_f8_e4m3_to_f32(uint8_t value);
 
 /* Print tensor info (for debugging) */
 void safetensor_print(const safetensor_t *t);

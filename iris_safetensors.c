@@ -70,6 +70,7 @@ static safetensor_dtype_t parse_dtype(const char *s) {
     if (strcmp(s, "I32") == 0) return DTYPE_I32;
     if (strcmp(s, "I64") == 0) return DTYPE_I64;
     if (strcmp(s, "BOOL") == 0) return DTYPE_BOOL;
+    if (strcmp(s, "F8_E4M3") == 0) return DTYPE_F8_E4M3;
     return DTYPE_UNKNOWN;
 }
 
@@ -432,6 +433,32 @@ static float f16_to_f32(uint16_t f16) {
     return result;
 }
 
+float safetensor_f8_e4m3_to_f32(uint8_t value) {
+    /* Extract the compact sign, exponent, and mantissa fields */
+    uint32_t sign = (uint32_t)(value & 0x80u) << 24;
+    uint32_t exponent = (value >> 3) & 0x0fu;
+    uint32_t mantissa = value & 0x07u;
+    float result;
+
+    /* Decode zero and subnormal values directly */
+    if (exponent == 0) {
+        result = (float)mantissa * (1.0f / 512.0f);
+        return sign ? -result : result;
+    }
+
+    /* Preserve the sole E4M3FN NaN encoding */
+    if (exponent == 15 && mantissa == 7) {
+        uint32_t nan_bits = sign | 0x7fc00000u;
+        memcpy(&result, &nan_bits, sizeof(result));
+        return result;
+    }
+
+    /* Expand normal E4M3 values into exact F32 bits */
+    uint32_t bits = sign | ((exponent + 120u) << 23) | (mantissa << 20);
+    memcpy(&result, &bits, sizeof(result));
+    return result;
+}
+
 /* Return a tensor's data as a newly allocated f32 array. Handles dtype
  * conversion: f32 is memcpy'd directly, bf16 and f16 are converted
  * element-wise. The caller owns the returned buffer. This is the main
@@ -484,6 +511,14 @@ int safetensors_get_f32_into(const safetensors_file_t *sf, const safetensor_t *t
             const uint16_t *src = (const uint16_t *)data;
             for (int64_t i = 0; i < n; i++) {
                 out[i] = bf16_to_f32(src[i]);
+            }
+            break;
+        }
+
+        case DTYPE_F8_E4M3: {
+            const uint8_t *src = (const uint8_t *)data;
+            for (int64_t i = 0; i < n; i++) {
+                out[i] = safetensor_f8_e4m3_to_f32(src[i]);
             }
             break;
         }

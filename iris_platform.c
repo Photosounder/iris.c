@@ -17,6 +17,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 #endif
 
@@ -54,6 +55,30 @@ int iris_cpu_count(void) {
 
     /* Keep callers safe when the operating system cannot report a count. */
     return count > 0 ? (int)count : 1;
+#endif
+}
+
+void iris_sleep_ms(unsigned int milliseconds) {
+#ifdef _WIN32
+    /* Yield the processor through the native Windows scheduler */
+    Sleep(milliseconds);
+#else
+    /* Build and apply a nanosecond-resolution duration on Unix-like systems */
+    struct timespec duration;
+    duration.tv_sec = milliseconds / 1000u;
+    duration.tv_nsec = (long)(milliseconds % 1000u) * 1000000L;
+    nanosleep(&duration, NULL);
+#endif
+}
+
+void iris_lower_process_priority(void) {
+#ifdef _WIN32
+    /* Lower CPU, memory, and disk scheduling priority for the whole process */
+    if (!SetPriorityClass(GetCurrentProcess(), PROCESS_MODE_BACKGROUND_BEGIN))
+        SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
+#else
+    /* Leave process priority unchanged where no portable lowering API is used */
+    return;
 #endif
 }
 

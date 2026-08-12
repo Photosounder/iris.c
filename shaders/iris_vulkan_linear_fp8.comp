@@ -1,0 +1,64 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer XBuffer { float x[]; };
+layout(set = 0, binding = 1, std430) readonly buffer WeightBuffer { uint weight[]; };
+layout(set = 0, binding = 2, std430) buffer OutputBuffer { float output_data[]; };
+
+layout(push_constant) uniform Push { uint p[6]; } pc;
+shared float x_tile[16][16];
+shared float weight_tile[16][16];
+
+float load_fp8(uint index) {
+    uint packed = weight[index >> 2u];
+    uint bits = (packed >> ((index & 3u) * 8u)) & 0xffu;
+    uint exponent = (bits >> 3u) & 0x0fu;
+    uint mantissa = bits & 0x07u;
+    float value;
+
+    if (exponent == 0u)
+        value = float(mantissa) * (1.0 / 512.0);
+    else if (exponent == 15u && mantissa == 7u)
+        value = uintBitsToFloat(0x7fc00000u);
+    else
+        value = (1.0 + float(mantissa) * 0.125) * exp2(float(exponent) - 7.0);
+    return (bits & 0x80u) != 0u ? -value : value;
+}
+
+void main() {
+    uint local_row = gl_LocalInvocationID.y;
+    uint local_col = gl_LocalInvocationID.x;
+    uint row = pc.p[3] + gl_GlobalInvocationID.y;
+    uint col = gl_GlobalInvocationID.x;
+    uint rows = pc.p[0];
+    uint inner = pc.p[1];
+    uint cols = pc.p[2];
+    uint weight_offset = pc.p[4];
+    float weight_scale = uintBitsToFloat(pc.p[5]);
+
+    float sum = 0.0;
+    for (uint base = 0u; base < inner; base += 16u) {
+        uint x_index = base + local_col;
+        uint weight_index = base + local_col;
+
+        x_tile[local_row][local_col] =
+            row < rows && x_index < inner
+                ? x[row * inner + x_index]
+                : 0.0;
+
+        uint weight_col = gl_WorkGroupID.x * 16u + local_row;
+        weight_tile[local_row][local_col] =
+            weight_col < cols && weight_index < inner
+                ? load_fp8(weight_offset + weight_col * inner + weight_index) * weight_scale
+                : 0.0;
+        barrier();
+
+        for (uint i = 0u; i < 16u; i++)
+            sum += x_tile[local_row][i] * weight_tile[local_col][i];
+        barrier();
+    }
+
+    if (row < rows && col < cols)
+        output_data[row * cols + col] = sum;
+}

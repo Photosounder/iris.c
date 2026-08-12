@@ -2473,6 +2473,11 @@ void iris_gpu_batch_begin(void) {
     }
 }
 
+void iris_gpu_set_friendly_mode(int enable) {
+    /* Keep the cross-backend scheduling API harmless on Metal */
+    (void)enable;
+}
+
 void iris_gpu_batch_end(void) {
     if (!g_initialized || !g_tensor_batch_mode) return;
 

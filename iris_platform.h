@@ -13,6 +13,12 @@ double iris_time_ms(void);
 /* Return the number of logical processors available to the process. */
 int iris_cpu_count(void);
 
+/* Pause the current thread for at least the requested duration */
+void iris_sleep_ms(unsigned int milliseconds);
+
+/* Lower this process below normal interactive application priority */
+void iris_lower_process_priority(void);
+
 /* Create a unique temporary directory and write its path to the caller's buffer. */
 int iris_create_temp_dir(char *path, size_t path_size);
 

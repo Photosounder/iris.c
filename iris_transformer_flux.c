@@ -2719,7 +2719,8 @@ static int single_block_forward_gpu_chained(iris_gpu_tensor_t hidden_gpu,
         iris_gpu_tensor_read(v_gpu, v_cpu);
         float *attn_out_cpu = tf->single_attn_out;
         mha_forward(attn_out_cpu, q_cpu, k_cpu, v_cpu, seq, heads, head_dim, tf);
-        memcpy(iris_gpu_tensor_data(attn_out_gpu), attn_out_cpu, seq * h_size * sizeof(float));
+        /* Upload the CPU fallback result through the backend transfer path */
+        iris_gpu_tensor_write(attn_out_gpu, attn_out_cpu);
     }
 
     /* === Phase 9: SwiGLU on GPU === */
@@ -2750,7 +2751,8 @@ static int single_block_forward_gpu_chained(iris_gpu_tensor_t hidden_gpu,
             float *hidden_cpu = tf->work2;  /* Reuse work2 since mod_params is done */
             iris_gpu_tensor_read(hidden_gpu, hidden_cpu);
             gated_add(hidden_cpu, gate, proj_out_cpu, seq, h_size);
-            memcpy(iris_gpu_tensor_data(hidden_gpu), hidden_cpu, seq * h_size * sizeof(float));
+            /* Upload the CPU fallback result through the backend transfer path */
+            iris_gpu_tensor_write(hidden_gpu, hidden_cpu);
             goto cleanup;
         }
     }

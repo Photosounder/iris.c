@@ -32,7 +32,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_VULKAN)
 #include "iris_metal.h"
 #endif
 
@@ -228,7 +228,8 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "      --sigmoid         Use Flux shifted sigmoid schedule\n");
     fprintf(stderr, "      --flowmatch       Use Z-Image FlowMatch Euler schedule\n\n");
     fprintf(stderr, "Model options:\n");
-    fprintf(stderr, "      --base            Force base model mode (undistilled, CFG enabled)\n\n");
+    fprintf(stderr, "      --base            Force base model mode (undistilled, CFG enabled)\n");
+    fprintf(stderr, "      --transformer PATH Use a standalone transformer safetensors file\n\n");
     fprintf(stderr, "Reference images (img2img / multi-reference):\n");
     fprintf(stderr, "  -i, --input PATH      Reference image (can specify up to %d)\n", MAX_INPUT_IMAGES);
     fprintf(stderr, "                        Multiple -i flags combine images via in-context conditioning\n\n");
@@ -244,6 +245,7 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "      --no-mmap         Disable mmap, load all weights upfront\n");
     fprintf(stderr, "      --no-license-info Suppress non-commercial license warning\n");
     fprintf(stderr, "      --blas-threads N  Set number of BLAS threads (OpenBLAS only)\n");
+    fprintf(stderr, "      --gpu-friendly    Preserve desktop responsiveness during GPU work\n");
     fprintf(stderr, "  -h, --help            Show this help\n\n");
     fprintf(stderr, "Examples:\n");
     fprintf(stderr, "  %s -d model/ -p \"a cat on a rainbow\" -o cat.png\n", prog);
@@ -291,6 +293,8 @@ int main(int argc, char *argv[]) {
         {"debug-py",   no_argument,       0, 'D'},
         {"no-license-info", no_argument, 0, 258},
         {"blas-threads",required_argument, 0, 259},
+        {"transformer", required_argument, 0, 262},
+        {"gpu-friendly",no_argument,       0, 263},
         {0, 0, 0, 0}
     };
 
@@ -302,6 +306,7 @@ int main(int argc, char *argv[]) {
     int num_inputs = 0;
     char *embeddings_path = NULL;
     char *noise_path = NULL;
+    char *transformer_path = NULL;
 
     iris_params params = {
         .width = DEFAULT_WIDTH,
@@ -320,6 +325,7 @@ int main(int argc, char *argv[]) {
     int force_base = 0;
     int no_license_info = 0;
     int blas_threads = 0; (void)blas_threads;
+    int gpu_friendly = 0;
     term_graphics_proto graphics_proto = detect_terminal_graphics();
 
     int opt;
@@ -363,11 +369,25 @@ int main(int argc, char *argv[]) {
             case 258: no_license_info = 1; break;
             case 'D': debug_py = 1; break;
             case 259: blas_threads = atoi(optarg); break;
+            case 262: transformer_path = optarg; break;
+            case 263: gpu_friendly = 1; break;
             default:
                 print_usage(argv[0]);
                 return 1;
         }
     }
+
+#ifdef USE_VULKAN
+    /* Configure lower-impact GPU scheduling before the backend initializes */
+    if (gpu_friendly) {
+        iris_gpu_set_friendly_mode(1);
+        iris_lower_process_priority();
+    }
+#else
+    /* Explain why the requested Vulkan scheduling behavior is unavailable */
+    if (gpu_friendly)
+        fprintf(stderr, "Warning: --gpu-friendly has no effect without a GPU backend\n");
+#endif
 
     /* BLAS: apply thread setting regardless of quiet mode */
 #if defined(USE_BLAS) && !defined(USE_METAL) && !defined(__APPLE__)
@@ -404,6 +424,11 @@ int main(int argc, char *argv[]) {
 #endif
 #else
         fprintf(stderr, "Generic: Pure C backend (no acceleration)\n");
+#endif
+#ifdef USE_VULKAN
+        /* Report the active cooperative GPU scheduling preset */
+        if (gpu_friendly)
+            fprintf(stderr, "GPU scheduling: friendly mode (short submissions, inter-process yields)\n");
 #endif
     }
 
@@ -486,6 +511,9 @@ int main(int argc, char *argv[]) {
         iris_set_mmap(ctx, 1);
         LOG_VERBOSE("  Using mmap mode for text encoder (lower memory)\n");
     }
+
+    /* Select a standalone transformer while retaining other model components */
+    if (transformer_path) iris_set_transformer_path(ctx, transformer_path);
 
     /* Override model type if --base was specified */
     if (force_base) {

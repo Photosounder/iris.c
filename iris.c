@@ -117,6 +117,7 @@ extern float *iris_init_noise(int batch, int channels, int h, int w, int64_t see
 /* Z-Image transformer and sampling */
 typedef struct zi_transformer zi_transformer_t;
 extern zi_transformer_t *zi_transformer_load_safetensors(const char *model_dir,
+                                                          const char *transformer_path,
                                                            int dim, int n_heads,
                                                            int n_layers, int n_refiner,
                                                            int cap_feat_dim, int in_channels,
@@ -201,6 +202,7 @@ struct iris_ctx {
     char model_name[64];
     char model_version[32];
     char model_dir[512];  /* For reloading text encoder if released */
+    char transformer_path[1024]; /* Optional standalone transformer checkpoint */
 
     /* Memory mode */
     int use_mmap;  /* Use mmap for text encoder (lower memory, slower) */
@@ -568,6 +570,7 @@ static int iris_load_zimage_transformer_if_needed(iris_ctx *ctx) {
     if (iris_phase_callback) iris_phase_callback("Loading Z-Image transformer", 0);
     ctx->zi_transformer = zi_transformer_load_safetensors(
         ctx->model_dir,
+        ctx->transformer_path,
         ctx->zi_dim, ctx->zi_dim / 128, ctx->zi_n_layers, ctx->zi_n_refiner,
         ctx->zi_cap_feat_dim, ctx->zi_in_channels, ctx->zi_patch_size,
         ctx->zi_rope_theta, ctx->zi_axes_dims);
@@ -578,6 +581,18 @@ static int iris_load_zimage_transformer_if_needed(iris_ctx *ctx) {
         return 0;
     }
     return 1;
+}
+
+void iris_set_transformer_path(iris_ctx *ctx, const char *path) {
+    if (!ctx || ctx->zi_transformer) return;
+
+    /* Store a standalone checkpoint override for deferred transformer loading */
+    if (path) {
+        strncpy(ctx->transformer_path, path, sizeof(ctx->transformer_path) - 1);
+        ctx->transformer_path[sizeof(ctx->transformer_path) - 1] = '\0';
+    } else {
+        ctx->transformer_path[0] = '\0';
+    }
 }
 
 /* Get transformer for debugging */

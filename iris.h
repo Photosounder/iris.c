@@ -128,6 +128,9 @@ void iris_release_text_encoder(iris_ctx *ctx);
  */
 void iris_set_mmap(iris_ctx *ctx, int enable);
 
+/* Override the deferred transformer with a standalone safetensors file */
+void iris_set_transformer_path(iris_ctx *ctx, const char *path);
+
 /*
  * Check if model is distilled (4-step) or base (50-step with CFG).
  * Returns 1 for distilled, 0 for base.
