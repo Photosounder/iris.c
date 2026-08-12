@@ -1,0 +1,73 @@
+#version 450
+
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 32) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer QBuffer { float q[]; };
+layout(set = 0, binding = 1, std430) readonly buffer KBuffer { float k[]; };
+layout(set = 0, binding = 2, std430) readonly buffer VBuffer { float v[]; };
+layout(set = 0, binding = 3, std430) buffer OutputBuffer { float output_data[]; };
+
+layout(push_constant) uniform Push { uint p[6]; } pc;
+
+void main() {
+    // Assign four head components to each subgroup lane
+    uint lane = gl_LocalInvocationID.x;
+    uint group = gl_WorkGroupID.x;
+    uint seq_q = pc.p[0];
+    uint seq_k = pc.p[1];
+    uint heads = pc.p[2];
+    uint head_dim = pc.p[3];
+    uint hidden = heads * head_dim;
+    uint query = pc.p[5] + group / heads;
+    uint head = group - (group / heads) * heads;
+    uint component = lane * 4u;
+    float scale = uintBitsToFloat(pc.p[4]);
+    if (query >= seq_q || head_dim > 128u) return;
+
+    // Keep the query and four output accumulators in registers
+    uint query_base = query * hidden + head * head_dim;
+    float query_values[4];
+    float accumulated[4];
+    for (uint part = 0u; part < 4u; part++) {
+        uint index = component + part;
+        query_values[part] = index < head_dim ? q[query_base + index] : 0.0;
+        accumulated[part] = 0.0;
+    }
+    float maximum = -3.402823466e+38;
+    float denominator = 0.0;
+
+    // Fuse the online softmax and value accumulation without workgroup barriers
+    for (uint key = 0u; key < seq_k; key++) {
+        uint key_base = key * hidden + head * head_dim;
+        float partial_dot = 0.0;
+        for (uint part = 0u; part < 4u; part++) {
+            uint index = component + part;
+            if (index < head_dim)
+                partial_dot += query_values[part] * k[key_base + index];
+        }
+        float scaled_score = subgroupAdd(partial_dot) * scale;
+        float new_maximum = max(maximum, scaled_score);
+        float rescale = exp(maximum - new_maximum);
+        float probability = exp(scaled_score - new_maximum);
+        denominator = denominator * rescale + probability;
+        maximum = new_maximum;
+
+        // Accumulate four value components per lane
+        for (uint part = 0u; part < 4u; part++) {
+            uint index = component + part;
+            if (index < head_dim) {
+                accumulated[part] = accumulated[part] * rescale +
+                                    probability * v[key_base + index];
+            }
+        }
+    }
+
+    // Normalize and store the four output components
+    for (uint part = 0u; part < 4u; part++) {
+        uint index = component + part;
+        if (index < head_dim)
+            output_data[query_base + index] = accumulated[part] / denominator;
+    }
+}

@@ -1,0 +1,79 @@
+#version 460
+
+#extension GL_EXT_bfloat16 : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+
+layout(local_size_x = 32) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer XBuffer { float x[]; };
+layout(set = 0, binding = 1, std430) readonly buffer WeightBuffer { uint weight[]; };
+layout(set = 0, binding = 2, std430) buffer OutputBuffer { float output_data[]; };
+
+layout(push_constant) uniform Push { uint p[6]; } pc;
+shared bfloat16_t x_tile[256];
+shared bfloat16_t weight_tile[256];
+
+float load_fp8(uint index) {
+    uint packed = weight[index >> 2u];
+    uint bits = (packed >> ((index & 3u) * 8u)) & 0xffu;
+    uint exponent = (bits >> 3u) & 0x0fu;
+    uint mantissa = bits & 0x07u;
+    float value;
+
+    if (exponent == 0u)
+        value = float(mantissa) * (1.0 / 512.0);
+    else if (exponent == 15u && mantissa == 7u)
+        value = uintBitsToFloat(0x7fc00000u);
+    else {
+        uint magnitude = ((exponent + 120u) << 23u) | (mantissa << 20u);
+        value = uintBitsToFloat(magnitude);
+    }
+    return (bits & 0x80u) != 0u ? -value : value;
+}
+
+void main() {
+    // Map one subgroup to one 16 by 16 output tile
+    uint lane = gl_LocalInvocationID.x;
+    uint tile_row = gl_WorkGroupID.y * 16u + pc.p[3];
+    uint tile_col = gl_WorkGroupID.x * 16u;
+    uint rows = pc.p[0];
+    uint inner = pc.p[1];
+    uint cols = pc.p[2];
+    uint weight_offset = pc.p[4];
+    float weight_scale = uintBitsToFloat(pc.p[5]);
+
+    coopmat<bfloat16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matrix_a;
+    coopmat<bfloat16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> matrix_b;
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> accumulator =
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+
+    // Stage FP32 activations and packed FP8 weights as BF16 tensor-core tiles
+    for (uint base = 0u; base < inner; base += 16u) {
+        for (uint element = lane; element < 256u; element += 32u) {
+            uint tile_inner = element & 15u;
+            uint tile_outer = element >> 4u;
+            uint row = tile_row + tile_outer;
+            uint col = tile_col + tile_outer;
+            uint inner_index = base + tile_inner;
+            x_tile[element] = bfloat16_t(
+                row < rows && inner_index < inner
+                    ? x[row * inner + inner_index]
+                    : 0.0);
+            weight_tile[tile_inner * 16u + tile_outer] = bfloat16_t(
+                col < cols && inner_index < inner
+                    ? load_fp8(weight_offset + col * inner + inner_index) * weight_scale
+                    : 0.0);
+        }
+        barrier();
+        coopMatLoad(matrix_a, x_tile, 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(matrix_b, weight_tile, 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+        accumulator = coopMatMulAdd(matrix_a, matrix_b, accumulator);
+        barrier();
+    }
+
+    // Store the completed tile directly into the FP32 output matrix
+    coopMatStore(accumulator, output_data,
+                 tile_row * cols + tile_col, cols,
+                 gl_CooperativeMatrixLayoutRowMajor);
+}

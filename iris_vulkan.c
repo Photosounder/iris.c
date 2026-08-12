@@ -38,10 +38,12 @@ typedef enum {
     VK_PIPE_LINEAR,
     VK_PIPE_LINEAR_BF16,
     VK_PIPE_LINEAR_FP8,
+    VK_PIPE_LINEAR_FP8_COOP,
     VK_PIPE_RMS_NORM,
     VK_PIPE_QK_RMS_NORM,
     VK_PIPE_ROPE_PAIR,
     VK_PIPE_ATTENTION,
+    VK_PIPE_ATTENTION_SUBGROUP,
     VK_PIPE_SILU_MUL,
     VK_PIPE_ADD,
     VK_PIPE_GATED_ADD,
@@ -86,6 +88,8 @@ typedef struct {
     unsigned int trace_window_packets;
     int dedicated_compute_queue;
     int global_low_priority;
+    int cooperative_matrix;
+    int subgroup_attention;
 } vk_context_t;
 
 static vk_context_t vk_ctx;
@@ -464,10 +468,15 @@ static int vk_submit_command_buffer(void) {
         if (vk_packet_trace_enabled()) {
             fprintf(stderr, "Vulkan: friendly packet %.1f ms\n", vk_ctx.last_submit_ms);
         } else if (now_ms - vk_ctx.trace_window_start_ms >= 10000.0) {
+            /* Report observed queue duty cycle over the completed trace window */
+            double window_ms = now_ms - vk_ctx.trace_window_start_ms;
+            double duty_percent = 100.0 * vk_ctx.trace_window_submit_ms / window_ms;
+            if (duty_percent > 100.0) duty_percent = 100.0;
             fprintf(stderr,
-                    "Vulkan trace: %u packets, %.1f ms GPU, %.1f ms longest\n",
+                    "Vulkan trace: %u packets, %.1f ms GPU (%.0f%% duty), "
+                    "%.1f ms longest\n",
                     vk_ctx.trace_window_packets, vk_ctx.trace_window_submit_ms,
-                    vk_ctx.trace_window_max_ms);
+                    duty_percent, vk_ctx.trace_window_max_ms);
             vk_ctx.trace_window_start_ms = now_ms;
             vk_ctx.trace_window_submit_ms = 0.0;
             vk_ctx.trace_window_max_ms = 0.0;
@@ -484,24 +493,19 @@ static int vk_submit_command_buffer(void) {
     if (vk_ctx.descriptor_pool)
         vkResetDescriptorPool(vk_ctx.device, vk_ctx.descriptor_pool, 0);
 
-    /* Reserve half of each scheduling cycle for desktop and competing GPU work */
-    if (result == VK_SUCCESS && vk_friendly_requested) {
-        double delay_ms = vk_ctx.last_submit_ms;
-        if (delay_ms < 2.0) delay_ms = 2.0;
-        if (delay_ms > 100.0) delay_ms = 100.0;
-        iris_sleep_ms((unsigned int)(delay_ms + 0.5));
-    }
+    /* Leave a brief scheduling window between bounded GPU submissions */
+    if (result == VK_SUCCESS && vk_friendly_requested) iris_sleep_ms(1);
     return result == VK_SUCCESS;
 }
 
 static int vk_friendly_next_chunk(int current, int maximum, int quantum) {
     /* Grow only while the measured packet remains comfortably interactive */
     if (!vk_friendly_requested) return maximum;
-    if (vk_ctx.last_submit_ms < 8.0 && current <= maximum / 2)
+    if (vk_ctx.last_submit_ms < 12.0 && current <= maximum / 2)
         return current * 2;
 
     /* Back off when a packet exceeded the desktop latency budget */
-    if (vk_ctx.last_submit_ms > 16.0 && current > quantum)
+    if (vk_ctx.last_submit_ms > 30.0 && current > quantum)
         return current / 2;
     return current;
 }
@@ -600,7 +604,9 @@ static int vk_dispatch(vk_pipeline_id_t pipeline_id,
     vk_memory_barrier();
     if ((pipeline_id == VK_PIPE_LINEAR || pipeline_id == VK_PIPE_LINEAR_BF16 ||
          pipeline_id == VK_PIPE_LINEAR_FP8 ||
-         pipeline_id == VK_PIPE_ATTENTION) && !temporary_batch) {
+         pipeline_id == VK_PIPE_LINEAR_FP8_COOP ||
+         pipeline_id == VK_PIPE_ATTENTION ||
+         pipeline_id == VK_PIPE_ATTENTION_SUBGROUP) && !temporary_batch) {
         /* Submit long-running kernels separately so one dispatch cannot trip TDR */
         vk_ctx.batch_active = 0;
         return vk_submit_command_buffer();
@@ -851,6 +857,12 @@ static int vk_linear_fp8_dispatch(iris_gpu_tensor_impl_t *out,
     int row_chunk = vk_friendly_requested ? 16 : 1024;
     uint32_t scale_bits;
     memcpy(&scale_bits, &weight_scale, sizeof(scale_bits));
+    vk_pipeline_id_t pipeline = VK_PIPE_LINEAR_FP8;
+
+    /* Use range-safe BF16 tensor-core tiles when every matrix edge is complete */
+    if (vk_ctx.cooperative_matrix && (seq_len & 15) == 0 &&
+        (in_dim & 15) == 0 && (out_dim & 15) == 0)
+        pipeline = VK_PIPE_LINEAR_FP8_COOP;
 
     /* Split large projections into bounded submissions for the Windows watchdog */
     for (int row_offset = 0; row_offset < seq_len;) {
@@ -859,7 +871,7 @@ static int vk_linear_fp8_dispatch(iris_gpu_tensor_impl_t *out,
         uint32_t push[6] = {(uint32_t)seq_len, (uint32_t)in_dim,
                             (uint32_t)out_dim, (uint32_t)row_offset,
                             (uint32_t)weight_offset, scale_bits};
-        if (!vk_dispatch(VK_PIPE_LINEAR_FP8, buffers, 3, push, 6,
+        if (!vk_dispatch(pipeline, buffers, 3, push, 6,
                          ((uint32_t)out_dim + 15u) / 16u,
                          ((uint32_t)row_count + 15u) / 16u, 1))
             return 0;
@@ -995,23 +1007,96 @@ static int vk_init_context(void) {
     }
     free(queues);
 
-    /* Detect support for inter-process low-priority queue scheduling */
+    /* Detect optional scheduling and cooperative-matrix extensions */
     uint32_t extension_count = 0;
     vkEnumerateDeviceExtensionProperties(vk_ctx.physical_device, NULL,
                                          &extension_count, NULL);
     VkExtensionProperties *extensions = calloc(extension_count, sizeof(*extensions));
     int has_global_priority = 0;
+    int has_cooperative_matrix = 0;
+    int has_shader_bfloat16 = 0;
     if (extensions) {
         vkEnumerateDeviceExtensionProperties(vk_ctx.physical_device, NULL,
                                              &extension_count, extensions);
         for (uint32_t i = 0; i < extension_count; i++) {
             if (strcmp(extensions[i].extensionName,
-                       VK_KHR_GLOBAL_PRIORITY_EXTENSION_NAME) == 0) {
+                       VK_KHR_GLOBAL_PRIORITY_EXTENSION_NAME) == 0)
                 has_global_priority = 1;
-                break;
-            }
+            if (strcmp(extensions[i].extensionName,
+                       VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME) == 0)
+                has_cooperative_matrix = 1;
+            if (strcmp(extensions[i].extensionName,
+                       VK_KHR_SHADER_BFLOAT16_EXTENSION_NAME) == 0)
+                has_shader_bfloat16 = 1;
         }
         free(extensions);
+    }
+
+    /* Verify the subgroup width used by the fused attention shader */
+    VkPhysicalDeviceSubgroupProperties subgroup_properties = {0};
+    subgroup_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
+    VkPhysicalDeviceProperties2 properties2 = {0};
+    properties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+    properties2.pNext = &subgroup_properties;
+    vkGetPhysicalDeviceProperties2(vk_ctx.physical_device, &properties2);
+    vk_ctx.subgroup_attention =
+        subgroup_properties.subgroupSize == 32u &&
+        (subgroup_properties.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) &&
+        (subgroup_properties.supportedOperations &
+         VK_SUBGROUP_FEATURE_ARITHMETIC_BIT);
+
+    /* Query the shader features and exact BF16-to-FP32 matrix tile */
+    VkPhysicalDeviceCooperativeMatrixFeaturesKHR cooperative_features = {0};
+    cooperative_features.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR;
+    VkPhysicalDeviceVulkan12Features vulkan12_features = {0};
+    vulkan12_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+    VkPhysicalDeviceShaderBfloat16FeaturesKHR bfloat16_features = {0};
+    bfloat16_features.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_BFLOAT16_FEATURES_KHR;
+    cooperative_features.pNext = has_shader_bfloat16 ? &bfloat16_features : NULL;
+    vulkan12_features.pNext = has_cooperative_matrix ? &cooperative_features : NULL;
+    VkPhysicalDeviceFeatures2 features2 = {0};
+    features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    features2.pNext = &vulkan12_features;
+    vkGetPhysicalDeviceFeatures2(vk_ctx.physical_device, &features2);
+    if (has_cooperative_matrix && has_shader_bfloat16 &&
+        cooperative_features.cooperativeMatrix &&
+        bfloat16_features.shaderBFloat16Type &&
+        bfloat16_features.shaderBFloat16CooperativeMatrix &&
+        vulkan12_features.vulkanMemoryModel) {
+        PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR get_matrix_properties =
+            (PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR)
+            vkGetInstanceProcAddr(vk_ctx.instance,
+                "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR");
+        uint32_t matrix_count = 0;
+        if (get_matrix_properties &&
+            get_matrix_properties(vk_ctx.physical_device, &matrix_count, NULL) == VK_SUCCESS) {
+            VkCooperativeMatrixPropertiesKHR *matrix_properties =
+                calloc(matrix_count, sizeof(*matrix_properties));
+            if (matrix_properties) {
+                for (uint32_t i = 0; i < matrix_count; i++)
+                    matrix_properties[i].sType =
+                        VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR;
+                if (get_matrix_properties(vk_ctx.physical_device, &matrix_count,
+                                          matrix_properties) == VK_SUCCESS) {
+                    for (uint32_t i = 0; i < matrix_count; i++) {
+                        VkCooperativeMatrixPropertiesKHR *entry = &matrix_properties[i];
+                        if (entry->MSize == 16u && entry->NSize == 16u &&
+                            entry->KSize == 16u &&
+                            entry->AType == VK_COMPONENT_TYPE_BFLOAT16_KHR &&
+                            entry->BType == VK_COMPONENT_TYPE_BFLOAT16_KHR &&
+                            entry->CType == VK_COMPONENT_TYPE_FLOAT32_KHR &&
+                            entry->ResultType == VK_COMPONENT_TYPE_FLOAT32_KHR &&
+                            entry->scope == VK_SCOPE_SUBGROUP_KHR) {
+                            vk_ctx.cooperative_matrix = 1;
+                            break;
+                        }
+                    }
+                }
+                free(matrix_properties);
+            }
+        }
     }
 
     float priority = vk_friendly_requested ? 0.25f : 1.0f;
@@ -1029,17 +1114,50 @@ static int vk_init_context(void) {
     device_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     device_info.queueCreateInfoCount = 1;
     device_info.pQueueCreateInfos = &queue_info;
-    const char *device_extensions[1] = {VK_KHR_GLOBAL_PRIORITY_EXTENSION_NAME};
-    if (vk_friendly_requested && has_global_priority) {
-        device_info.enabledExtensionCount = 1;
-        device_info.ppEnabledExtensionNames = device_extensions;
+    const char *device_extensions[3];
+    uint32_t enabled_extension_count = 0;
+
+    /* Enable only the optional extensions used by the selected fast paths */
+    if (vk_ctx.cooperative_matrix)
+        device_extensions[enabled_extension_count++] =
+            VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME;
+    if (vk_ctx.cooperative_matrix)
+        device_extensions[enabled_extension_count++] =
+            VK_KHR_SHADER_BFLOAT16_EXTENSION_NAME;
+    if (vk_friendly_requested && has_global_priority)
+        device_extensions[enabled_extension_count++] =
+            VK_KHR_GLOBAL_PRIORITY_EXTENSION_NAME;
+    device_info.enabledExtensionCount = enabled_extension_count;
+    device_info.ppEnabledExtensionNames = device_extensions;
+
+    /* Enable the matrix and SPIR-V memory-model features required by the shader */
+    VkPhysicalDeviceCooperativeMatrixFeaturesKHR enabled_cooperative = {0};
+    VkPhysicalDeviceShaderBfloat16FeaturesKHR enabled_bfloat16 = {0};
+    VkPhysicalDeviceVulkan12Features enabled_vulkan12 = {0};
+    if (vk_ctx.cooperative_matrix) {
+        enabled_cooperative.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR;
+        enabled_cooperative.cooperativeMatrix = VK_TRUE;
+        enabled_bfloat16.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_BFLOAT16_FEATURES_KHR;
+        enabled_bfloat16.shaderBFloat16Type = VK_TRUE;
+        enabled_bfloat16.shaderBFloat16CooperativeMatrix = VK_TRUE;
+        enabled_cooperative.pNext = &enabled_bfloat16;
+        enabled_vulkan12.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+        enabled_vulkan12.pNext = &enabled_cooperative;
+        enabled_vulkan12.vulkanMemoryModel = VK_TRUE;
+        device_info.pNext = &enabled_vulkan12;
     }
     result = vkCreateDevice(vk_ctx.physical_device, &device_info, NULL, &vk_ctx.device);
     if (result != VK_SUCCESS && queue_info.pNext) {
         /* Retry without global priority when policy or the driver refuses it */
         queue_info.pNext = NULL;
-        device_info.enabledExtensionCount = 0;
-        device_info.ppEnabledExtensionNames = NULL;
+        if (enabled_extension_count &&
+            strcmp(device_extensions[enabled_extension_count - 1],
+                   VK_KHR_GLOBAL_PRIORITY_EXTENSION_NAME) == 0)
+            enabled_extension_count--;
+        device_info.enabledExtensionCount = enabled_extension_count;
         result = vkCreateDevice(vk_ctx.physical_device, &device_info, NULL, &vk_ctx.device);
     } else if (result == VK_SUCCESS && queue_info.pNext) {
         vk_ctx.global_low_priority = 1;
@@ -1053,6 +1171,10 @@ static int vk_init_context(void) {
                 (double)vk_ctx.fp8_cache_limit / (1024.0 * 1024.0 * 1024.0));
         fprintf(stderr, "Vulkan friendly activations: device-local VRAM\n");
     }
+    fprintf(stderr, "Vulkan kernels: %s attention, %s FP8 linear\n",
+            vk_ctx.subgroup_attention ? "subgroup-fused" : "portable",
+            vk_ctx.cooperative_matrix
+                ? "BF16 cooperative-matrix" : "stable FP32 scalar");
     vkGetDeviceQueue(vk_ctx.device, vk_ctx.queue_family, 0, &vk_ctx.queue);
 
     VkCommandPoolCreateInfo pool_info = {0};
@@ -1124,16 +1246,21 @@ static int vk_init_context(void) {
         "shaders/iris_vulkan_linear.comp.spv",
         "shaders/iris_vulkan_linear_bf16.comp.spv",
         "shaders/iris_vulkan_linear_fp8.comp.spv",
+        "shaders/iris_vulkan_linear_fp8_coop.comp.spv",
         "shaders/iris_vulkan_rms_norm.comp.spv",
         "shaders/iris_vulkan_qk_rms_norm.comp.spv",
         "shaders/iris_vulkan_rope_pair.comp.spv",
         "shaders/iris_vulkan_attention.comp.spv",
+        "shaders/iris_vulkan_attention_subgroup.comp.spv",
         "shaders/iris_vulkan_silu_mul.comp.spv",
         "shaders/iris_vulkan_add.comp.spv",
         "shaders/iris_vulkan_gated_add.comp.spv",
         "shaders/iris_vulkan_adaln_norm.comp.spv"
     };
     for (int i = 0; i < VK_PIPE_COUNT; i++) {
+        /* Skip optional pipelines that the selected device cannot execute */
+        if (i == VK_PIPE_LINEAR_FP8_COOP && !vk_ctx.cooperative_matrix) continue;
+        if (i == VK_PIPE_ATTENTION_SUBGROUP && !vk_ctx.subgroup_attention) continue;
         if (!vk_create_pipeline((vk_pipeline_id_t)i, shader_paths[i])) return 0;
     }
     vk_ctx.initialized = 1;
@@ -1561,7 +1688,9 @@ int iris_gpu_attention_fused(iris_gpu_tensor_t out_tensor,
         if (query_count > query_chunk) query_count = query_chunk;
         uint32_t push[6] = {(uint32_t)seq_q, (uint32_t)seq_k, (uint32_t)heads,
                             (uint32_t)head_dim, scale_bits, (uint32_t)query_offset};
-        if (!vk_dispatch(VK_PIPE_ATTENTION, buffers, 4, push, 6,
+        vk_pipeline_id_t pipeline = vk_ctx.subgroup_attention
+            ? VK_PIPE_ATTENTION_SUBGROUP : VK_PIPE_ATTENTION;
+        if (!vk_dispatch(pipeline, buffers, 4, push, 6,
                          (uint32_t)query_count * (uint32_t)heads, 1, 1)) return 0;
         query_offset += query_count;
         query_chunk = vk_friendly_next_chunk(query_chunk, 16, 1);

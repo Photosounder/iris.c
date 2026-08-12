@@ -73,9 +73,8 @@ void iris_sleep_ms(unsigned int milliseconds) {
 
 void iris_lower_process_priority(void) {
 #ifdef _WIN32
-    /* Lower CPU, memory, and disk scheduling priority for the whole process */
-    if (!SetPriorityClass(GetCurrentProcess(), PROCESS_MODE_BACKGROUND_BEGIN))
-        SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
+    /* Keep interactive processes ahead without starving the GPU submission thread */
+    SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
 #else
     /* Leave process priority unchanged where no portable lowering API is used */
     return;
