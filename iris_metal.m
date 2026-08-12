@@ -1078,10 +1078,10 @@ static id<MTLBuffer> get_cached_bf16_as_f16_buffer(const uint16_t *weights, size
  * Pre-warm the bf16→f16 cache for a weight tensor.
  * This triggers the conversion and caching so it doesn't happen during inference.
  */
-void iris_metal_warmup_bf16(const uint16_t *bf16_weights, size_t num_elements) {
-    if (!g_initialized || !bf16_weights || num_elements == 0) return;
+int iris_metal_warmup_bf16(const uint16_t *bf16_weights, size_t num_elements) {
+    if (!g_initialized || !bf16_weights || num_elements == 0) return 0;
     /* Just calling this function triggers the conversion and caching */
-    (void)get_cached_bf16_as_f16_buffer(bf16_weights, num_elements);
+    return get_cached_bf16_as_f16_buffer(bf16_weights, num_elements) != nil;
 }
 
 void iris_metal_warmup_bf16_buffer(const uint16_t *bf16_weights, size_t num_elements) {

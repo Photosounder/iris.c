@@ -67,6 +67,19 @@ make vulkan
 ./iris -d zimage-turbo -p "a fish" -o fish.png
 ```
 
+The Vulkan executable links to the MSYS2 UCRT64 runtime DLLs. When launching
+from PowerShell or Explorer, either put `C:\msys\ucrt64\bin` on `PATH` or copy
+the runtime DLLs beside `iris.exe`. PowerShell example:
+
+```powershell
+$env:Path = 'C:\msys\ucrt64\bin;C:\msys\usr\bin;' + $env:Path
+.\iris.exe -d .\zimage-turbo -p "a fish" -o fish.png
+```
+
+The current Vulkan build imports `libopenblas.dll`; an error mentioning a
+different DLL name indicates a stale or differently linked executable. Rebuild
+with `make vulkan` from the UCRT64 shell rather than renaming OpenBLAS DLLs.
+
 For a dispatch and memory trace while diagnosing a driver problem, set `IRIS_VULKAN_TRACE=1` before running Iris.
 
 ## Example Output

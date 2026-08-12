@@ -197,6 +197,76 @@ static iris_gpu_tensor_impl_t *vk_tensor_alloc_bytes(size_t bytes, int is_f16,
     return tensor;
 }
 
+static int vk_create_device_local_buffer(size_t bytes, VkBuffer *buffer,
+                                         VkDeviceMemory *memory) {
+    VkBufferCreateInfo buffer_info = {0};
+    buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    buffer_info.size = bytes ? bytes : 4;
+    buffer_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                        VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                        VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    /* Create the immutable weight buffer in device-local memory */
+    VkResult result = vkCreateBuffer(vk_ctx.device, &buffer_info, NULL, buffer);
+    if (result != VK_SUCCESS) {
+        vk_report(result, "vkCreateBuffer");
+        return 0;
+    }
+
+    /* Choose device-local memory so immutable weights do not consume host commit */
+    VkMemoryRequirements requirements;
+    vkGetBufferMemoryRequirements(vk_ctx.device, *buffer, &requirements);
+    uint32_t memory_type = vk_find_memory_type(
+        requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0);
+    if (memory_type == UINT32_MAX) {
+        vkDestroyBuffer(vk_ctx.device, *buffer, NULL);
+        *buffer = VK_NULL_HANDLE;
+        return 0;
+    }
+
+    /* Allocate and bind the device-local storage */
+    VkMemoryAllocateInfo allocation = {0};
+    allocation.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocation.allocationSize = requirements.size;
+    allocation.memoryTypeIndex = memory_type;
+    result = vkAllocateMemory(vk_ctx.device, &allocation, NULL, memory);
+    if (result != VK_SUCCESS) {
+        vk_report(result, "vkAllocateMemory");
+        vkDestroyBuffer(vk_ctx.device, *buffer, NULL);
+        *buffer = VK_NULL_HANDLE;
+        return 0;
+    }
+    result = vkBindBufferMemory(vk_ctx.device, *buffer, *memory, 0);
+    if (result != VK_SUCCESS) {
+        vk_report(result, "vkBindBufferMemory");
+        vkFreeMemory(vk_ctx.device, *memory, NULL);
+        vkDestroyBuffer(vk_ctx.device, *buffer, NULL);
+        *buffer = VK_NULL_HANDLE;
+        *memory = VK_NULL_HANDLE;
+        return 0;
+    }
+    vk_ctx.memory_used += requirements.size;
+    return 1;
+}
+
+static iris_gpu_tensor_impl_t *vk_tensor_alloc_device_local_bytes(size_t bytes,
+                                                                    int is_f16,
+                                                                    int cached) {
+    iris_gpu_tensor_impl_t *tensor = calloc(1, sizeof(*tensor));
+    if (!tensor) return NULL;
+    if (!vk_create_device_local_buffer(bytes, &tensor->buffer, &tensor->memory)) {
+        free(tensor);
+        return NULL;
+    }
+    tensor->bytes = bytes;
+    tensor->elements = is_f16 ? bytes / 2 : bytes / sizeof(float);
+    tensor->is_f16 = is_f16;
+    tensor->cached = cached;
+    tensor->host_visible = 0;
+    return tensor;
+}
+
 static void vk_tensor_unmap(iris_gpu_tensor_impl_t *tensor);
 
 static void vk_tensor_destroy(iris_gpu_tensor_impl_t *tensor) {
@@ -443,23 +513,49 @@ static iris_gpu_tensor_impl_t *vk_cached(const void *host_ptr, size_t bytes,
             entry->is_f16 == is_f16) {
             void *mapped = NULL;
             /* Refresh mutable host arrays before reusing their cached buffer */
-            if (vk_tensor_map(entry->tensor, &mapped)) {
+            if (!is_f16 && vk_tensor_map(entry->tensor, &mapped)) {
                 memcpy(mapped, host_ptr, bytes);
                 vk_tensor_unmap(entry->tensor);
             }
             return entry->tensor;
         }
     }
-    iris_gpu_tensor_impl_t *tensor = vk_tensor_alloc_bytes(bytes, is_f16, 1);
+    iris_gpu_tensor_impl_t *tensor = NULL;
+    if (is_f16 && !vk_ctx.batch_active)
+        tensor = vk_tensor_alloc_device_local_bytes(bytes, is_f16, 1);
+    if (!tensor)
+        tensor = vk_tensor_alloc_bytes(bytes, is_f16, 1);
     if (!tensor) return NULL;
-    void *mapped = NULL;
-    if (!vk_tensor_map(tensor, &mapped)) {
-        tensor->cached = 0;
-        vk_tensor_destroy(tensor);
-        return NULL;
+
+    /* Upload device-local weights through a temporary host-visible staging buffer */
+    if (tensor->host_visible) {
+        void *mapped = NULL;
+        if (!vk_tensor_map(tensor, &mapped)) {
+            tensor->cached = 0;
+            vk_tensor_destroy(tensor);
+            return NULL;
+        }
+        memcpy(mapped, host_ptr, bytes);
+        vk_tensor_unmap(tensor);
+    } else {
+        iris_gpu_tensor_impl_t *staging = vk_tensor_alloc_bytes(bytes, is_f16, 0);
+        void *mapped = NULL;
+        if (!staging || !vk_tensor_map(staging, &mapped)) {
+            if (staging) vk_tensor_destroy(staging);
+            tensor->cached = 0;
+            vk_tensor_destroy(tensor);
+            return NULL;
+        }
+        memcpy(mapped, host_ptr, bytes);
+        vk_tensor_unmap(staging);
+        if (!vk_copy_region(tensor, 0, staging, 0, bytes)) {
+            vk_tensor_destroy(staging);
+            tensor->cached = 0;
+            vk_tensor_destroy(tensor);
+            return NULL;
+        }
+        vk_tensor_destroy(staging);
     }
-    memcpy(mapped, host_ptr, bytes);
-    vk_tensor_unmap(tensor);
 
     vk_cached_buffer_t *entry = calloc(1, sizeof(*entry));
     if (!entry) {
@@ -696,9 +792,10 @@ int iris_metal_shaders_available(void) {
     return iris_metal_init();
 }
 
-void iris_metal_warmup_bf16(const uint16_t *bf16_weights, size_t num_elements) {
-    (void)bf16_weights;
-    (void)num_elements;
+int iris_metal_warmup_bf16(const uint16_t *bf16_weights, size_t num_elements) {
+    if (!bf16_weights || num_elements == 0 || !vk_ready()) return 0;
+    /* Upload immutable BF16 weights before their CPU copies are released */
+    return vk_cached(bf16_weights, num_elements * sizeof(uint16_t), 1) != NULL;
 }
 
 static void vk_clear_cache(void) {

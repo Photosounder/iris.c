@@ -721,7 +721,7 @@ int iris_metal_shaders_available(void);
  * Call this during model loading to avoid conversion overhead during inference.
  * This converts bf16 weights to f16 and caches the result.
  */
-void iris_metal_warmup_bf16(const uint16_t *bf16_weights, size_t num_elements);
+int iris_metal_warmup_bf16(const uint16_t *bf16_weights, size_t num_elements);
 
 /*
  * Pre-warm the bf16 buffer cache for a weight tensor.
