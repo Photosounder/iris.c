@@ -28,6 +28,10 @@
 /* Minimum matrix size to use GPU (smaller matrices are faster on CPU) */
 #define MIN_GPU_ELEMENTS (512 * 512)
 
+#ifndef IRIS_CONV_MAX_COL_ELEMENTS
+#define IRIS_CONV_MAX_COL_ELEMENTS ((size_t)256 * 1024 * 1024)
+#endif
+
 /* fast_expf is defined in iris_kernels.h */
 
 /* Progress callbacks - set by caller before inference */
@@ -358,20 +362,20 @@ void iris_conv2d(float *out, const float *in, const float *weight, const float *
     int outW = (W + 2 * padding - kW) / stride + 1;
 
 #ifdef USE_BLAS
-    /* im2col + BLAS optimization with tiling for large convolutions */
-    size_t col_size = (size_t)in_ch * kH * kW * outH * outW;
-    size_t max_col_size = (size_t)256 * 1024 * 1024;  /* 1GB limit */
+    /* im2col + BLAS optimization with reduction tiling for large convolutions */
+    int K = in_ch * kH * kW;
+    int pixels = outH * outW;
+    size_t col_size = (size_t)K * pixels;
+    size_t max_col_size = IRIS_CONV_MAX_COL_ELEMENTS;  /* 1GB default limit */
 
-    /* For large convolutions, process in row tiles */
-    int tile_rows = outH;
+    /* Split the reduction dimension while retaining the complete spatial plane */
+    int tile_k = K;
     if (col_size > max_col_size) {
-        /* Calculate how many rows we can process at once */
-        size_t row_size = (size_t)in_ch * kH * kW * outW;
-        tile_rows = (int)(max_col_size / row_size);
-        if (tile_rows < 1) tile_rows = 1;
+        tile_k = (int)(max_col_size / (size_t)pixels);
+        if (tile_k < 1) tile_k = 1;
     }
 
-    size_t tile_col_size = (size_t)in_ch * kH * kW * tile_rows * outW;
+    size_t tile_col_size = (size_t)tile_k * pixels;
     float *col = malloc(tile_col_size * sizeof(float));
     if (!col) {
         goto naive_fallback;
@@ -381,48 +385,38 @@ void iris_conv2d(float *out, const float *in, const float *weight, const float *
         const float *in_b = in + b * in_ch * H * W;
         float *out_b = out + b * out_ch * outH * outW;
 
-        /* Process in tiles of rows */
-        for (int tile_start = 0; tile_start < outH; tile_start += tile_rows) {
-            int tile_end = tile_start + tile_rows;
-            if (tile_end > outH) tile_end = outH;
-            int tile_h = tile_end - tile_start;
-            int tile_pixels = tile_h * outW;
+        /* Accumulate reduction tiles without introducing spatial boundaries */
+        for (int k_start = 0; k_start < K; k_start += tile_k) {
+            int k_count = K - k_start;
+            if (k_count > tile_k) k_count = tile_k;
 
-            /* im2col for this tile: col[in_ch*kH*kW, tile_pixels] */
-            int col_row = 0;
-            for (int ic = 0; ic < in_ch; ic++) {
-                for (int kh = 0; kh < kH; kh++) {
-                    for (int kw = 0; kw < kW; kw++) {
-                        for (int oh = tile_start; oh < tile_end; oh++) {
-                            for (int ow = 0; ow < outW; ow++) {
-                                int ih = oh * stride - padding + kh;
-                                int iw = ow * stride - padding + kw;
-                                int col_idx = col_row * tile_pixels + (oh - tile_start) * outW + ow;
-                                if (ih >= 0 && ih < H && iw >= 0 && iw < W) {
-                                    col[col_idx] = in_b[ic * H * W + ih * W + iw];
-                                } else {
-                                    col[col_idx] = 0.0f;
-                                }
-                            }
-                        }
-                        col_row++;
+            /* Materialize complete output planes for this kernel-channel slice */
+            for (int local_k = 0; local_k < k_count; local_k++) {
+                int kernel_index = k_start + local_k;
+                int ic = kernel_index / (kH * kW);
+                int kernel_offset = kernel_index % (kH * kW);
+                int kh = kernel_offset / kW;
+                int kw = kernel_offset % kW;
+                float *col_plane = col + (size_t)local_k * pixels;
+                for (int oh = 0; oh < outH; oh++) {
+                    for (int ow = 0; ow < outW; ow++) {
+                        int ih = oh * stride - padding + kh;
+                        int iw = ow * stride - padding + kw;
+                        int pixel = oh * outW + ow;
+                        if (ih >= 0 && ih < H && iw >= 0 && iw < W)
+                            col_plane[pixel] = in_b[ic * H * W + ih * W + iw];
+                        else
+                            col_plane[pixel] = 0.0f;
                     }
                 }
             }
 
-            /* BLAS sgemm: tmp[out_ch, tile_pixels] = weight[out_ch, K] @ col[K, tile_pixels]
-             * where K = in_ch * kH * kW */
-            int K = in_ch * kH * kW;
-
-            /* Write sgemm output directly to out_b using strided ldc.
-             * Row oc of sgemm output goes to out_b[oc * outH*outW + tile_start*outW],
-             * which is exactly the right position in NCHW layout. */
-            float *out_tile = out_b + tile_start * outW;
+            /* Accumulate each reduction slice into the full contiguous NCHW plane */
             cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                        out_ch, tile_pixels, K,
-                        1.0f, weight, K,
-                        col, tile_pixels,
-                        0.0f, out_tile, outH * outW);
+                        out_ch, pixels, k_count,
+                        1.0f, weight + k_start, K,
+                        col, pixels,
+                        k_start == 0 ? 0.0f : 1.0f, out_b, pixels);
         }
 
         /* Add bias */
