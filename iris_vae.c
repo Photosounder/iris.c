@@ -120,24 +120,9 @@ typedef struct iris_vae {
     size_t work_size, work3_size;
 } iris_vae_t;
 
-/* Grow VAE scratch buffers to the dimensions used by the current operation */
-static int vae_ensure_workspace(iris_vae_t *vae, int batch, int H, int W) {
-    /* Validate the requested dimensions */
-    if (!vae || batch <= 0 || H <= 0 || W <= 0 || H > vae->max_h || W > vae->max_w)
-        return -1;
-
-    /* Cover the 256-channel tensor produced by the final decoder upsample */
-    size_t pixels = (size_t)batch * (size_t)H * (size_t)W;
-    size_t base_size = pixels * (size_t)vae->base_channels * sizeof(float);
-    size_t main_size = base_size * 2;
-
-    /* Compute the largest scratch size used by a residual block */
-    size_t scratch_size = base_size * 3;
-    size_t padded_size = (size_t)batch * (size_t)(H + 1) * (size_t)(W + 1) *
-                         (size_t)vae->base_channels * sizeof(float);
-    if (scratch_size < padded_size)
-        scratch_size = padded_size;
-
+/* Grow VAE scratch buffers to explicit byte capacities */
+static int vae_ensure_workspace_bytes(iris_vae_t *vae, size_t main_size,
+                                      size_t scratch_size) {
     /* Grow the two main buffers together when needed */
     if (!vae->work1 || !vae->work2 || vae->work_size < main_size) {
         float *work1 = (float *)realloc(vae->work1, main_size);
@@ -158,6 +143,27 @@ static int vae_ensure_workspace(iris_vae_t *vae, int batch, int H, int W) {
     }
 
     return 0;
+}
+
+/* Grow VAE scratch buffers to the dimensions used by the current operation */
+static int vae_ensure_workspace(iris_vae_t *vae, int batch, int H, int W) {
+    /* Validate the requested dimensions */
+    if (!vae || batch <= 0 || H <= 0 || W <= 0 || H > vae->max_h || W > vae->max_w)
+        return -1;
+
+    /* Cover the 256-channel tensor produced by the final decoder upsample */
+    size_t pixels = (size_t)batch * (size_t)H * (size_t)W;
+    size_t base_size = pixels * (size_t)vae->base_channels * sizeof(float);
+    size_t main_size = base_size * 2;
+
+    /* Compute the largest scratch size used by a residual block */
+    size_t scratch_size = base_size * 3;
+    size_t padded_size = (size_t)batch * (size_t)(H + 1) * (size_t)(W + 1) *
+                         (size_t)vae->base_channels * sizeof(float);
+    if (scratch_size < padded_size)
+        scratch_size = padded_size;
+
+    return vae_ensure_workspace_bytes(vae, main_size, scratch_size);
 }
 
 /* Forward declarations */
@@ -805,8 +811,16 @@ iris_image *iris_vae_decode(iris_vae_t *vae, const float *latent,
 #if defined(USE_METAL) || defined(USE_VULKAN)
     /* Try GPU-resident path first (eliminates CPU<->GPU round-trips per conv) */
     if (iris_metal_available()) {
-        iris_image *gpu_result = vae_decode_gpu(vae, latent, batch, latent_h, latent_w);
-        if (gpu_result) return gpu_result;
+        /* Reserve only the host storage used by unpatchification and middle attention */
+        size_t mid_elements = (size_t)batch * (size_t)(vae->base_channels * 4) *
+                              (size_t)(latent_h * 2) * (size_t)(latent_w * 2);
+        size_t gpu_main_size = mid_elements * sizeof(float);
+        size_t gpu_scratch_size = gpu_main_size * 5;
+        if (vae_ensure_workspace_bytes(vae, gpu_main_size, gpu_scratch_size) == 0) {
+            iris_image *gpu_result = vae_decode_gpu(vae, latent, batch,
+                                                    latent_h, latent_w);
+            if (gpu_result) return gpu_result;
+        }
         /* Fall through to CPU path on failure */
     }
 #endif
