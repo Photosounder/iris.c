@@ -1,0 +1,16 @@
+#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) readonly buffer InputBuffer { uint input_data[]; };
+layout(set = 0, binding = 1, std430) buffer OutputBuffer { float output_data[]; };
+layout(push_constant) uniform Push { uint p[1]; } pc;
+
+void main() {
+    // Unpack two BF16 values from each storage word
+    uint pair = gl_GlobalInvocationID.x;
+    uint index = pair * 2u;
+    if (index >= pc.p[0]) return;
+    uint packed = input_data[pair];
+    output_data[index] = uintBitsToFloat((packed & 0xffffu) << 16u);
+    if (index + 1u < pc.p[0])
+        output_data[index + 1u] = uintBitsToFloat(packed & 0xffff0000u);
+}

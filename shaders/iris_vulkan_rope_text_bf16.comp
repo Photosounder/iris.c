@@ -1,0 +1,42 @@
+#version 450
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0, std430) buffer QBuffer { uint q[]; };
+layout(set = 0, binding = 1, std430) buffer KBuffer { uint k[]; };
+layout(set = 0, binding = 2, std430) readonly buffer CosBuffer { float cos_cache[]; };
+layout(set = 0, binding = 3, std430) readonly buffer SinBuffer { float sin_cache[]; };
+layout(push_constant) uniform Push { uint p[4]; } pc;
+float decode_bf16(uint value, uint index) { uint bits = (index & 1u) == 0u ? value & 0xffffu : value >> 16u; return uintBitsToFloat(bits << 16u); }
+uint encode(float value) { uint bits = floatBitsToUint(value); bits += 0x7fffu + ((bits >> 16u) & 1u); return bits >> 16u; }
+void main() {
+    // Rotate two split-half pairs and pack adjacent results together
+    uint pair = gl_GlobalInvocationID.x;
+    uint half_dim = pc.p[3] / 2u;
+    uint pairs_per_head = (half_dim + 1u) / 2u;
+    uint max_heads = max(pc.p[1], pc.p[2]);
+    uint per_position = max_heads * pairs_per_head;
+    uint position = pair / per_position;
+    uint remainder = pair - position * per_position;
+    uint head = remainder / pairs_per_head;
+    uint first = (remainder - head * pairs_per_head) * 2u;
+    if (position >= pc.p[0] || first >= half_dim) return;
+    float c0 = cos_cache[position * half_dim + first];
+    float s0 = sin_cache[position * half_dim + first];
+    float c1 = first + 1u < half_dim ? cos_cache[position * half_dim + first + 1u] : 1.0;
+    float s1 = first + 1u < half_dim ? sin_cache[position * half_dim + first + 1u] : 0.0;
+    if (head < pc.p[1]) {
+        uint base = position * pc.p[1] * pc.p[3] + head * pc.p[3];
+        float x0 = decode_bf16(q[(base + first) >> 1u], base + first), y0 = decode_bf16(q[(base + first + half_dim) >> 1u], base + first + half_dim);
+        float x1 = first + 1u < half_dim ? decode_bf16(q[(base + first + 1u) >> 1u], base + first + 1u) : 0.0;
+        float y1 = first + 1u < half_dim ? decode_bf16(q[(base + first + 1u + half_dim) >> 1u], base + first + 1u + half_dim) : 0.0;
+        q[(base + first) >> 1u] = encode(x0*c0-y0*s0) | (encode(x1*c1-y1*s1) << 16u);
+        q[(base + first + half_dim) >> 1u] = encode(x0*s0+y0*c0) | (encode(x1*s1+y1*c1) << 16u);
+    }
+    if (head < pc.p[2]) {
+        uint base = position * pc.p[2] * pc.p[3] + head * pc.p[3];
+        float x0 = decode_bf16(k[(base + first) >> 1u], base + first), y0 = decode_bf16(k[(base + first + half_dim) >> 1u], base + first + half_dim);
+        float x1 = first + 1u < half_dim ? decode_bf16(k[(base + first + 1u) >> 1u], base + first + 1u) : 0.0;
+        float y1 = first + 1u < half_dim ? decode_bf16(k[(base + first + 1u + half_dim) >> 1u], base + first + 1u + half_dim) : 0.0;
+        k[(base + first) >> 1u] = encode(x0*c0-y0*s0) | (encode(x1*c1-y1*s1) << 16u);
+        k[(base + first + half_dim) >> 1u] = encode(x0*s0+y0*c0) | (encode(x1*s1+y1*c1) << 16u);
+    }
+}

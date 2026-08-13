@@ -1,0 +1,37 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 32) in;
+layout(set = 0, binding = 0, std430) readonly buffer QBuffer { uint q[]; };
+layout(set = 0, binding = 1, std430) readonly buffer KBuffer { uint k[]; };
+layout(set = 0, binding = 2, std430) readonly buffer VBuffer { uint v[]; };
+layout(set = 0, binding = 3, std430) buffer OutputBuffer { uint output_data[]; };
+layout(set = 0, binding = 4, std430) readonly buffer MaskBuffer { int mask[]; };
+layout(push_constant) uniform Push { uint p[6]; } pc;
+float decode_bf16(uint value, uint index) { uint bits = (index & 1u) == 0u ? value & 0xffffu : value >> 16u; return uintBitsToFloat(bits << 16u); }
+uint encode(float value) { uint bits = floatBitsToUint(value); bits += 0x7fffu + ((bits >> 16u) & 1u); return bits >> 16u; }
+void main() {
+    // Fuse causal GQA attention with online softmax for one query and head
+    uint lane = gl_LocalInvocationID.x;
+    uint group = gl_WorkGroupID.x;
+    uint q_heads = pc.p[1], kv_heads = pc.p[2], head_dim = pc.p[3];
+    uint query = group / q_heads, head = group - query * q_heads;
+    uint kv_head = head / (q_heads / kv_heads);
+    uint component = lane * 4u;
+    uint q_base = query * q_heads * head_dim + head * head_dim;
+    float qv[4], acc[4];
+    for (uint part=0u; part<4u; part++) { uint d=component+part; qv[part]=d<head_dim?decode_bf16(q[(q_base+d)>>1u],q_base+d):0.0; acc[part]=0.0; }
+    float maximum=-3.402823466e+38, denominator=0.0, scale=uintBitsToFloat(pc.p[4]);
+    for (uint key=0u; key<=query; key++) {
+        if (pc.p[5] != 0u && mask[key] == 0) continue;
+        uint base=key*kv_heads*head_dim+kv_head*head_dim;
+        float partial=0.0;
+        for(uint part=0u;part<4u;part++){uint d=component+part;if(d<head_dim)partial+=qv[part]*decode_bf16(k[(base+d)>>1u],base+d);}
+        float score=subgroupAdd(partial)*scale;
+        float next=max(maximum,score), rescale=exp(maximum-next), probability=exp(score-next);
+        denominator=denominator*rescale+probability; maximum=next;
+        for(uint part=0u;part<4u;part++){uint d=component+part;if(d<head_dim)acc[part]=acc[part]*rescale+probability*decode_bf16(v[(base+d)>>1u],base+d);}
+    }
+    // Pack each lane's four output components into two words
+    if(component<head_dim){output_data[(q_base+component)>>1u]=encode(acc[0]/denominator)|(encode(acc[1]/denominator)<<16u);}
+    if(component+2u<head_dim){output_data[(q_base+component+2u)>>1u]=encode(acc[2]/denominator)|(encode(acc[3]/denominator)<<16u);}
+}

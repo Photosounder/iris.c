@@ -14,7 +14,7 @@
 #include "iris.h"
 #include "iris_kernels.h"
 #include "iris_safetensors.h"
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_VULKAN)
 #include "iris_metal.h"
 #endif
 #include <stdio.h>
@@ -513,7 +513,7 @@ float *iris_vae_encode(iris_vae_t *vae, const float *img,
  * GPU-Resident Decoder
  * ======================================================================== */
 
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_VULKAN)
 
 /* GPU resblock: all operations on GPU, returns new tensor */
 static iris_gpu_tensor_t resblock_forward_gpu(iris_gpu_tensor_t x,
@@ -646,6 +646,12 @@ static iris_image *vae_decode_gpu(iris_vae_t *vae, const float *latent,
     x = t;
     if (iris_vae_progress_callback) iris_vae_progress_callback(progress++, total_blocks);
 
+#ifdef USE_VULKAN
+    /* Submit one VAE residual block at a time for Windows watchdog safety */
+    iris_gpu_batch_end();
+    iris_gpu_batch_begin();
+#endif
+
     /* Mid block attention: sync to CPU, run attention, upload back */
     {
         size_t attn_size = (size_t)batch * mid_ch * cur_h * cur_w;
@@ -681,6 +687,12 @@ static iris_image *vae_decode_gpu(iris_vae_t *vae, const float *latent,
     x = t;
     if (iris_vae_progress_callback) iris_vae_progress_callback(progress++, total_blocks);
 
+#ifdef USE_VULKAN
+    /* Submit the second middle residual block before spatial upsampling */
+    iris_gpu_batch_end();
+    iris_gpu_batch_begin();
+#endif
+
     int block_idx = 0;
     int up_idx = 0;
 
@@ -695,6 +707,12 @@ static iris_image *vae_decode_gpu(iris_vae_t *vae, const float *latent,
             if (!t) { iris_gpu_batch_end(); return NULL; }
             x = t;
             if (iris_vae_progress_callback) iris_vae_progress_callback(progress++, total_blocks);
+
+#ifdef USE_VULKAN
+            /* Bound each decoder residual block to one Vulkan submission */
+            iris_gpu_batch_end();
+            iris_gpu_batch_begin();
+#endif
         }
 
         /* Upsample (except level 0) */
@@ -714,6 +732,12 @@ static iris_image *vae_decode_gpu(iris_vae_t *vae, const float *latent,
 
             cur_h = new_h;
             cur_w = new_w;
+
+#ifdef USE_VULKAN
+            /* Submit each upsample convolution before growing the next level */
+            iris_gpu_batch_end();
+            iris_gpu_batch_begin();
+#endif
         }
     }
 
@@ -764,7 +788,7 @@ static iris_image *vae_decode_gpu(iris_vae_t *vae, const float *latent,
     return img;
 }
 
-#endif /* USE_METAL */
+#endif /* USE_METAL || USE_VULKAN */
 
 /* ========================================================================
  * Decoder Forward Pass
@@ -781,7 +805,7 @@ iris_image *iris_vae_decode(iris_vae_t *vae, const float *latent,
     if (vae_ensure_workspace(vae, batch, latent_h * 16, latent_w * 16) != 0)
         return NULL;
 
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_VULKAN)
     /* Try GPU-resident path first (eliminates CPU<->GPU round-trips per conv) */
     if (iris_metal_available()) {
         iris_image *gpu_result = vae_decode_gpu(vae, latent, batch, latent_h, latent_w);

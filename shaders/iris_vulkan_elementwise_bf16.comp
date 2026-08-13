@@ -1,0 +1,20 @@
+#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) readonly buffer ABuffer { uint a[]; };
+layout(set = 0, binding = 1, std430) readonly buffer BBuffer { uint b[]; };
+layout(set = 0, binding = 2, std430) buffer OutputBuffer { uint output_data[]; };
+layout(push_constant) uniform Push { uint p[2]; } pc;
+float decode(uint bits) { return uintBitsToFloat(bits << 16u); }
+uint encode(float value) { uint bits = floatBitsToUint(value); bits += 0x7fffu + ((bits >> 16u) & 1u); return bits >> 16u; }
+void main() {
+    // Process two adjacent BF16 values per invocation
+    uint pair = gl_GlobalInvocationID.x;
+    uint index = pair * 2u;
+    if (index >= pc.p[0]) return;
+    uint av = a[pair], bv = b[pair];
+    float a0 = decode(av & 0xffffu), a1 = decode(av >> 16u);
+    float b0 = decode(bv & 0xffffu), b1 = decode(bv >> 16u);
+    float out0 = pc.p[1] == 0u ? a0 + b0 : (a0 / (1.0 + exp(-a0))) * b0;
+    float out1 = pc.p[1] == 0u ? a1 + b1 : (a1 / (1.0 + exp(-a1))) * b1;
+    output_data[pair] = encode(out0) | (encode(out1) << 16u);
+}

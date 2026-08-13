@@ -1,0 +1,60 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer XBuffer { float x[]; };
+layout(set = 0, binding = 1, std430) readonly buffer GammaBuffer { float gamma[]; };
+layout(set = 0, binding = 2, std430) readonly buffer BetaBuffer { float beta[]; };
+layout(set = 0, binding = 3, std430) buffer OutputBuffer { float output_data[]; };
+
+layout(push_constant) uniform Push { uint p[5]; } pc;
+
+shared float partial_sum[256];
+shared float partial_square_sum[256];
+
+void main() {
+    // Reduce one normalization group per workgroup
+    uint lane = gl_LocalInvocationID.x;
+    uint group_index = gl_WorkGroupID.x;
+    uint channels = pc.p[1];
+    uint spatial = pc.p[2];
+    uint groups = pc.p[3];
+    uint channels_per_group = channels / groups;
+    uint group_elements = channels_per_group * spatial;
+    uint batch_index = group_index / groups;
+    uint local_group = group_index - batch_index * groups;
+    uint base_channel = local_group * channels_per_group;
+    float sum = 0.0;
+    float square_sum = 0.0;
+    for (uint index = lane; index < group_elements; index += 256u) {
+        uint channel = base_channel + index / spatial;
+        uint position = index - (index / spatial) * spatial;
+        float value = x[(batch_index * channels + channel) * spatial + position];
+        sum += value;
+        square_sum += value * value;
+    }
+    partial_sum[lane] = sum;
+    partial_square_sum[lane] = square_sum;
+    barrier();
+
+    // Combine per-lane moments in shared memory
+    for (uint width = 128u; width > 0u; width >>= 1u) {
+        if (lane < width) {
+            partial_sum[lane] += partial_sum[lane + width];
+            partial_square_sum[lane] += partial_square_sum[lane + width];
+        }
+        barrier();
+    }
+    float inverse_count = 1.0 / float(group_elements);
+    float mean = partial_sum[0] * inverse_count;
+    float variance = partial_square_sum[0] * inverse_count - mean * mean;
+    float inverse_std = inversesqrt(max(variance, 0.0) + uintBitsToFloat(pc.p[4]));
+
+    // Normalize and affine-transform the group in place or out of place
+    for (uint index = lane; index < group_elements; index += 256u) {
+        uint channel = base_channel + index / spatial;
+        uint position = index - (index / spatial) * spatial;
+        uint offset = (batch_index * channels + channel) * spatial + position;
+        output_data[offset] = (x[offset] - mean) * inverse_std * gamma[channel] + beta[channel];
+    }
+}

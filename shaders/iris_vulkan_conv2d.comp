@@ -1,0 +1,52 @@
+#version 450
+
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) readonly buffer XBuffer { float x[]; };
+layout(set = 0, binding = 1, std430) readonly buffer WeightBuffer { float weight[]; };
+layout(set = 0, binding = 2, std430) readonly buffer BiasBuffer { float bias[]; };
+layout(set = 0, binding = 3, std430) buffer OutputBuffer { float output_data[]; };
+layout(push_constant) uniform Push { uint p[13]; } pc;
+
+void main() {
+    // Compute one NCHW output element with a direct convolution
+    uint local_output = gl_GlobalInvocationID.x;
+    uint output_offset = pc.p[11];
+    uint index = output_offset + local_output;
+    uint batch = pc.p[0];
+    uint in_channels = pc.p[1];
+    uint out_channels = pc.p[2];
+    uint height = pc.p[3];
+    uint width = pc.p[4];
+    uint kernel_height = pc.p[5];
+    uint kernel_width = pc.p[6];
+    uint stride = pc.p[7];
+    uint padding = pc.p[8];
+    uint out_height = pc.p[9];
+    uint out_width = pc.p[10];
+    uint out_spatial = out_height * out_width;
+    uint total = batch * out_channels * out_spatial;
+    if (index >= total) return;
+    uint batch_index = index / (out_channels * out_spatial);
+    uint remainder = index - batch_index * out_channels * out_spatial;
+    uint out_channel = remainder / out_spatial;
+    uint position = remainder - out_channel * out_spatial;
+    uint out_y = position / out_width;
+    uint out_x = position - out_y * out_width;
+    float sum = pc.p[12] != 0u ? bias[out_channel] : 0.0;
+    for (uint in_channel = 0u; in_channel < in_channels; in_channel++) {
+        for (uint ky = 0u; ky < kernel_height; ky++) {
+            int input_y = int(out_y * stride + ky) - int(padding);
+            if (input_y < 0 || input_y >= int(height)) continue;
+            for (uint kx = 0u; kx < kernel_width; kx++) {
+                int input_x = int(out_x * stride + kx) - int(padding);
+                if (input_x < 0 || input_x >= int(width)) continue;
+                uint input_index = ((batch_index * in_channels + in_channel) * height +
+                                    uint(input_y)) * width + uint(input_x);
+                uint weight_index = ((out_channel * in_channels + in_channel) *
+                                     kernel_height + ky) * kernel_width + kx;
+                sum += x[input_index] * weight[weight_index];
+            }
+        }
+    }
+    output_data[index] = sum;
+}

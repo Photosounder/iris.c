@@ -1,0 +1,40 @@
+#version 450
+
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) readonly buffer InputBuffer { uint input_data[]; };
+layout(set = 0, binding = 1, std430) buffer OutputBuffer { uint output_data[]; };
+layout(push_constant) uniform Push { uint p[3]; } pc;
+
+float load_fp8(uint index) {
+    uint packed = input_data[index >> 2u];
+    uint bits = (packed >> ((index & 3u) * 8u)) & 0xffu;
+    uint exponent = (bits >> 3u) & 0x0fu;
+    uint mantissa = bits & 0x07u;
+    float value;
+    if (exponent == 0u)
+        value = float(mantissa) * (1.0 / 512.0);
+    else if (exponent == 15u && mantissa == 7u)
+        value = uintBitsToFloat(0x7fc00000u);
+    else
+        value = uintBitsToFloat(((exponent + 120u) << 23u) | (mantissa << 20u));
+    return (bits & 0x80u) != 0u ? -value : value;
+}
+
+uint encode_bf16(float value) {
+    uint bits = floatBitsToUint(value);
+    bits += 0x7fffu + ((bits >> 16u) & 1u);
+    return bits >> 16u;
+}
+
+void main() {
+    // Decode two adjacent weights into one packed BF16 storage word
+    uint pair = gl_GlobalInvocationID.x;
+    uint first = pair * 2u;
+    uint elements = pc.p[1];
+    if (first >= elements) return;
+    float scale = uintBitsToFloat(pc.p[2]);
+    uint low = encode_bf16(load_fp8(pc.p[0] + first) * scale);
+    uint high = first + 1u < elements
+        ? encode_bf16(load_fp8(pc.p[0] + first + 1u) * scale) : 0u;
+    output_data[pair] = low | (high << 16u);
+}

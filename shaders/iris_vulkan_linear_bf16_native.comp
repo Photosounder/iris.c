@@ -1,0 +1,74 @@
+#version 460
+#extension GL_EXT_bfloat16 : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+layout(local_size_x = 32) in;
+layout(set = 0, binding = 0, std430) readonly buffer XBuffer { uint x[]; };
+layout(set = 0, binding = 1, std430) readonly buffer WeightBuffer { uint weight[]; };
+layout(set = 0, binding = 2, std430) buffer OutputBuffer { uint output_data[]; };
+layout(push_constant) uniform Push { uint p[3]; } pc;
+shared bfloat16_t x_tile[256];
+shared bfloat16_t weight_tile[256];
+shared float output_tile[256];
+
+float decode_bf16(uint packed, uint index) {
+    uint bits = (index & 1u) == 0u ? packed & 0xffffu : packed >> 16u;
+    return uintBitsToFloat(bits << 16u);
+}
+
+uint encode_bf16(float value) {
+    uint bits = floatBitsToUint(value);
+    bits += 0x7fffu + ((bits >> 16u) & 1u);
+    return bits >> 16u;
+}
+
+void main() {
+    // Map one subgroup to one sixteen-by-sixteen BF16 output tile
+    uint lane = gl_LocalInvocationID.x;
+    uint tile_row = gl_WorkGroupID.y * 16u;
+    uint tile_col = gl_WorkGroupID.x * 16u;
+    uint rows = pc.p[0];
+    uint inner = pc.p[1];
+    uint cols = pc.p[2];
+    coopmat<bfloat16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matrix_a;
+    coopmat<bfloat16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> matrix_b;
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> accumulator =
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    for (uint base = 0u; base < inner; base += 16u) {
+        for (uint element = lane; element < 256u; element += 32u) {
+            uint inner_index = element & 15u;
+            uint outer = element >> 4u;
+            uint row = tile_row + outer;
+            uint col = tile_col + outer;
+            x_tile[element] = bfloat16_t(row < rows && base + inner_index < inner
+                ? decode_bf16(x[(row * inner + base + inner_index) >> 1u],
+                              row * inner + base + inner_index) : 0.0);
+            weight_tile[inner_index * 16u + outer] = bfloat16_t(
+                col < cols && base + inner_index < inner
+                ? decode_bf16(weight[(col * inner + base + inner_index) >> 1u],
+                              col * inner + base + inner_index) : 0.0);
+        }
+        barrier();
+        coopMatLoad(matrix_a, x_tile, 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(matrix_b, weight_tile, 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+        accumulator = coopMatMulAdd(matrix_a, matrix_b, accumulator);
+        barrier();
+    }
+    coopMatStore(accumulator, output_tile, 0u, 16u,
+                 gl_CooperativeMatrixLayoutRowMajor);
+    barrier();
+
+    // Pack pairs so no two lanes race on one storage word
+    for (uint pair = lane; pair < 128u; pair += 32u) {
+        uint local = pair * 2u;
+        uint local_row = local >> 4u;
+        uint local_col = local & 15u;
+        uint row = tile_row + local_row;
+        uint col = tile_col + local_col;
+        if (row < rows && col < cols) {
+            uint low = encode_bf16(output_tile[local]);
+            uint high = col + 1u < cols ? encode_bf16(output_tile[local + 1u]) : 0u;
+            output_data[(row * cols + col) >> 1u] = low | (high << 16u);
+        }
+    }
+}

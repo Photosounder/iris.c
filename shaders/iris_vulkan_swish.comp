@@ -1,0 +1,15 @@
+#version 450
+
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) readonly buffer XBuffer { float x[]; };
+layout(set = 0, binding = 1, std430) buffer OutputBuffer { float output_data[]; };
+layout(push_constant) uniform Push { uint p[1]; } pc;
+
+void main() {
+    // Apply SiLU independently to every element
+    uint index = gl_GlobalInvocationID.x;
+    if (index < pc.p[0]) {
+        float value = x[index];
+        output_data[index] = value / (1.0 + exp(-value));
+    }
+}

@@ -1,0 +1,87 @@
+#version 460
+#extension GL_EXT_bfloat16 : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+layout(local_size_x = 32) in;
+layout(set = 0, binding = 0, std430) readonly buffer XBuffer { float x[]; };
+layout(set = 0, binding = 1, std430) readonly buffer WeightBuffer { float weight[]; };
+layout(set = 0, binding = 2, std430) readonly buffer BiasBuffer { float bias[]; };
+layout(set = 0, binding = 3, std430) buffer OutputBuffer { float output_data[]; };
+layout(push_constant) uniform Push { uint p[13]; } pc;
+shared bfloat16_t weight_tile[256];
+shared bfloat16_t input_tile[256];
+shared float output_tile[256];
+
+void main() {
+    // Map one subgroup to sixteen output channels by sixteen output pixels
+    uint lane = gl_LocalInvocationID.x;
+    uint out_channel_start = gl_WorkGroupID.y * 16u;
+    uint pixel_start = pc.p[12] + gl_WorkGroupID.x * 16u;
+    uint batch_index = gl_WorkGroupID.z;
+    uint in_channels = pc.p[1], out_channels = pc.p[2];
+    uint height = pc.p[3], width = pc.p[4];
+    uint kernel_height = pc.p[5], kernel_width = pc.p[6];
+    uint stride = pc.p[7], padding = pc.p[8];
+    uint out_height = pc.p[9], out_width = pc.p[10];
+    uint pixels = out_height * out_width;
+    uint reduction = in_channels * kernel_height * kernel_width;
+    coopmat<bfloat16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matrix_a;
+    coopmat<bfloat16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> matrix_b;
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> accumulator =
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+
+    // Materialize implicit-im2col tiles and accumulate them on matrix hardware
+    for (uint reduction_start = 0u; reduction_start < reduction; reduction_start += 16u) {
+        for (uint element = lane; element < 256u; element += 32u) {
+            uint reduction_in_tile = element & 15u;
+            uint outer = element >> 4u;
+            uint reduction_index = reduction_start + reduction_in_tile;
+            uint out_channel = out_channel_start + outer;
+            weight_tile[element] = bfloat16_t(
+                out_channel < out_channels && reduction_index < reduction
+                    ? weight[out_channel * reduction + reduction_index] : 0.0);
+
+            uint pixel = pixel_start + outer;
+            float input_value = 0.0;
+            if (pixel < pixels && reduction_index < reduction) {
+                uint kernel_area = kernel_height * kernel_width;
+                uint in_channel = reduction_index / kernel_area;
+                uint kernel_position = reduction_index - in_channel * kernel_area;
+                uint kernel_y = kernel_position / kernel_width;
+                uint kernel_x = kernel_position - kernel_y * kernel_width;
+                uint out_y = pixel / out_width;
+                uint out_x = pixel - out_y * out_width;
+                int input_y = int(out_y * stride + kernel_y) - int(padding);
+                int input_x = int(out_x * stride + kernel_x) - int(padding);
+                if (input_y >= 0 && input_y < int(height) &&
+                    input_x >= 0 && input_x < int(width)) {
+                    uint input_index = ((batch_index * in_channels + in_channel) * height +
+                                        uint(input_y)) * width + uint(input_x);
+                    input_value = x[input_index];
+                }
+            }
+            input_tile[reduction_in_tile * 16u + outer] = bfloat16_t(input_value);
+        }
+        barrier();
+        coopMatLoad(matrix_a, weight_tile, 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(matrix_b, input_tile, 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+        accumulator = coopMatMulAdd(matrix_a, matrix_b, accumulator);
+        barrier();
+    }
+    coopMatStore(accumulator, output_tile, 0u, 16u,
+                 gl_CooperativeMatrixLayoutRowMajor);
+    barrier();
+
+    // Store valid NCHW results and apply the optional channel bias
+    for (uint element = lane; element < 256u; element += 32u) {
+        uint local_channel = element >> 4u;
+        uint local_pixel = element & 15u;
+        uint out_channel = out_channel_start + local_channel;
+        uint pixel = pixel_start + local_pixel;
+        if (out_channel < out_channels && pixel < pixels) {
+            uint output_index = (batch_index * out_channels + out_channel) * pixels + pixel;
+            output_data[output_index] = output_tile[element] +
+                (pc.p[11] != 0u ? bias[out_channel] : 0.0);
+        }
+    }
+}

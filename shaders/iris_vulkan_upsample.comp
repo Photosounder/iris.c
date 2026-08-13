@@ -1,0 +1,23 @@
+#version 450
+
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) readonly buffer XBuffer { float x[]; };
+layout(set = 0, binding = 1, std430) buffer OutputBuffer { float output_data[]; };
+layout(push_constant) uniform Push { uint p[3]; } pc;
+
+void main() {
+    // Map each output pixel to its nearest input pixel
+    uint index = gl_GlobalInvocationID.x;
+    uint channels = pc.p[0];
+    uint height = pc.p[1];
+    uint width = pc.p[2];
+    uint out_height = height * 2u;
+    uint out_width = width * 2u;
+    uint out_spatial = out_height * out_width;
+    if (index >= channels * out_spatial) return;
+    uint channel = index / out_spatial;
+    uint position = index - channel * out_spatial;
+    uint y = position / out_width;
+    uint column = position - y * out_width;
+    output_data[index] = x[(channel * height + y / 2u) * width + column / 2u];
+}

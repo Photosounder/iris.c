@@ -26,8 +26,8 @@
 #endif
 #endif
 
-/* Use Metal for GPU acceleration */
-#ifdef USE_METAL
+/* Use the shared GPU tensor API for Metal or Vulkan acceleration */
+#if defined(USE_METAL) || defined(USE_VULKAN)
 #include "iris_metal.h"
 #endif
 
@@ -140,7 +140,7 @@ struct qwen3_model {
 /* Forward declarations for mmap streaming mode */
 static int load_layer_weights(qwen3_layer_t *layer, safetensors_file_t **files,
                               int num_files, int layer_idx);
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_VULKAN)
 static int load_layer_weights_small_f32(qwen3_layer_t *layer, safetensors_file_t **files,
                                         int num_files, int layer_idx);
 static int load_layer_weights_bf16(qwen3_layer_t *layer, safetensors_file_t **files,
@@ -528,7 +528,7 @@ static void qwen3_layer_forward(qwen3_model_t *model, qwen3_layer_t *layer,
     }
 }
 
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_VULKAN)
 /* ========================================================================
  * BF16 GPU-Accelerated Layer Forward
  * Uses GPU for linear layers, keeps attention/norm on CPU for simplicity.
@@ -1020,6 +1020,13 @@ static int qwen3_forward_gpu(qwen3_model_t *model, int seq_len, const int *atten
 
         if (iris_text_progress_callback)
             iris_text_progress_callback(layer_idx, model->num_layers);
+
+#ifdef USE_VULKAN
+        /* Bound Qwen submissions to one layer for watchdog safety and progress */
+        iris_gpu_batch_end();
+        iris_metal_clear_bf16_cache_only();
+        if (layer_idx < last_layer) iris_gpu_batch_begin();
+#endif
     }
 
     if (!ok) {
@@ -1057,7 +1064,7 @@ static int qwen3_forward_gpu(qwen3_model_t *model, int seq_len, const int *atten
     return read_ok;
 }
 
-#endif /* USE_METAL */
+#endif /* USE_METAL || USE_VULKAN */
 
 /* ========================================================================
  * Forward Pass
@@ -1090,7 +1097,7 @@ float *qwen3_forward(qwen3_model_t *model, const int *input_ids,
     }
 
     /* Run through transformer layers */
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_VULKAN)
     /* Try fully GPU-resident path: 1 sync instead of 72, skips unneeded layers */
     if (model->use_bf16 && iris_metal_available() && seq_len <= 512) {
         if (qwen3_forward_gpu(model, seq_len, attention_mask))
@@ -1109,12 +1116,12 @@ float *qwen3_forward(qwen3_model_t *model, const int *input_ids,
     for (int layer_idx = 0; layer_idx <= last_layer; layer_idx++) {
         /* In mmap mode, load layer weights on-demand */
         if (model->use_mmap) {
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_VULKAN)
             if (model->use_bf16) {
                 /* Load only small f32 weights (layer norms) + bf16 projection weights */
                 if (load_layer_weights_small_f32(&model->layers[layer_idx], model->sf_files, model->num_sf_files, layer_idx) != 0) {
                     fprintf(stderr, "Failed to load layer %d small weights\n", layer_idx);
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_VULKAN)
                     if (batch_mode) iris_gpu_batch_end();
 #endif
                     return NULL;
@@ -1130,7 +1137,7 @@ float *qwen3_forward(qwen3_model_t *model, const int *input_ids,
             }
         }
 
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_VULKAN)
         if (model->use_bf16 && iris_metal_available()) {
             qwen3_layer_forward_bf16(model, &model->layers[layer_idx], seq_len, attention_mask);
         } else
@@ -1162,7 +1169,7 @@ float *qwen3_forward(qwen3_model_t *model, const int *input_ids,
             iris_text_progress_callback(layer_idx, model->num_layers);
     }
 
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_VULKAN)
     /* End batch mode */
     if (batch_mode) {
         iris_gpu_batch_end();
@@ -1170,7 +1177,7 @@ float *qwen3_forward(qwen3_model_t *model, const int *input_ids,
 #endif
 
     /* Build output embeddings */
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_VULKAN)
 concatenate: (void)0; /* label needs a statement; can't precede a declaration in C */
 #endif
     int text_dim = model->text_dim;
@@ -1214,7 +1221,7 @@ static float *load_tensor(safetensors_file_t **files, int num_files, const char 
     return NULL;
 }
 
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_VULKAN)
 /* Helper to load bf16 tensor directly (zero-copy from mmap region) */
 static uint16_t *load_tensor_bf16(safetensors_file_t **files, int num_files, const char *name) {
     for (int f = 0; f < num_files; f++) {
@@ -1306,7 +1313,7 @@ static int load_layer_weights(qwen3_layer_t *layer, safetensors_file_t **files,
     return 0;
 }
 
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_VULKAN)
 /* Load bf16 weights for a layer (GPU acceleration path).
  * Returns 1 if all bf16 weights loaded successfully, 0 otherwise.
  * bf16 pointers are direct into mmap region - do NOT free them. */
@@ -1649,7 +1656,7 @@ qwen3_model_t *qwen3_model_load_mmap(const char *model_dir) {
         qwen3_set_defaults(model);
     }
 
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_VULKAN)
     /* Enable bf16 GPU acceleration when Metal is available.
      * Set IRIS_QWEN3_NO_BF16=1 to disable for debugging. */
     model->use_bf16 = (iris_metal_available() && !getenv("IRIS_QWEN3_NO_BF16")) ? 1 : 0;
