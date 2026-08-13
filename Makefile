@@ -16,7 +16,7 @@ ifeq ($(IS_WINDOWS),)
 CITA_CFLAGS =
 CITA_OBJS =
 else
-CITA_INCLUDE ?= ../CITAlloc
+CITA_INCLUDE ?= third_party/cit_alloc
 CITA_CFLAGS = -DIRIS_USE_CITA -I$(CITA_INCLUDE) -include iris_cita.h
 CITA_OBJS = cita_impl.o
 CITA_LDFLAGS = -luser32

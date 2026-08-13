@@ -332,7 +332,7 @@ sudo dnf install openblas-devel
 
 ### Windows
 
-Windows builds use the native MinGW/UCRT toolchain. Install the MSYS2 UCRT64 environment with GCC and Make, open an **MSYS2 UCRT64** shell, and place the [CIT Allocator](https://github.com/Photosounder/CITAlloc) checkout beside the Iris checkout as `../CITAlloc`. Then run:
+Windows builds use the native MinGW/UCRT toolchain. Install the MSYS2 UCRT64 environment with GCC and Make, then open an **MSYS2 UCRT64** shell. The required [CIT Allocator](https://github.com/Photosounder/CITAlloc) headers are included in `third_party/cit_alloc`. Then run:
 
 ```bash
 make windows       # Pure C build with no external runtime dependency
