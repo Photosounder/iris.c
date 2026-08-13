@@ -1,6 +1,7 @@
 #!/bin/sh
 
 seed_file="seed.txt"
+seed=$(tr -d '[:space:]' < "$seed_file")
 
 cp iris.exe iris_copy.exe || exit 1
 
