@@ -1,3 +1,15 @@
+# Welcome to Michel's edition of iris.c
+
+I, Michel Rouzic, defiler of codebases, have struck again and commited another AI crime against maintainability. I took the original [iris.c](https://github.com/antirez/iris.c) which was macOS/Linux only with only CPU/Metal backends and made it work on Windows with a Vulkan backend. I also made it work with FP8 models (on Vulkan, not on the CPU). As a result there are a couple of new command line options:
+
+* `--transformer <path to model>` Specify where the model is. For instance I use `--transformer "E:\ComfyUI_windows_portable\ComfyUI\models\diffusion_models\zImageTurboQuantized_fp8ScaledE4m3fnKJ.safetensors"`.
+
+* `--gpu-friendly` avoids making your computer lag hard while it runs.
+
+I also use my own memory allocator to see what's going on (through its companion visualisation program) which allowed me to notice strange things (like 6 GB buffers that were mostly empty) which led to optimisations. Always actually look at your heap with your actual eyes, bros.
+
+I did not edit anything manually, even the rest of this README file was edited by ChatGPT. This fork is 100% a vibeslopped horror show, but it runs fine, at least on my machine. I need about 7 minutes to render a 1024x1024 image with 8 steps on an RTX A2000 12GB with Vulkan. I asked ChatGPT 5.6 Sol to optimise more by doing stuff that the Metal implementation and ComfyUI do but that's as far as I could get.
+
 # Iris - a C inference pipeline for image synthesis models
 
 Iris is an inference pipeline that generates images from text prompts using open weights diffusion transformer models. It is implemented entirely in C, with zero external dependencies beyond the C standard library. MPS and BLAS acceleration are optional but recommended. Under macOS, a BLAS API is part of the system, so nothing is required.
@@ -320,7 +332,7 @@ sudo dnf install openblas-devel
 
 ### Windows
 
-Windows builds use the native MinGW/UCRT toolchain. Install the MSYS2 UCRT64 environment with GCC and Make, open an **MSYS2 UCRT64** shell, and place the [CIT Allocator](https://github.com/antirez/CITAlloc) checkout beside the Iris checkout as `../CITAlloc`. Then run:
+Windows builds use the native MinGW/UCRT toolchain. Install the MSYS2 UCRT64 environment with GCC and Make, open an **MSYS2 UCRT64** shell, and place the [CIT Allocator](https://github.com/Photosounder/CITAlloc) checkout beside the Iris checkout as `../CITAlloc`. Then run:
 
 ```bash
 make windows       # Pure C build with no external runtime dependency
