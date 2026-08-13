@@ -286,6 +286,56 @@ int iris_gpu_linear_fp8_stream_into(iris_gpu_tensor_t out,
                                     size_t weight_offset,
                                     float weight_scale,
                                     int seq_len, int in_dim, int out_dim);
+
+/* Vulkan-only FP8 projections for a BF16-resident transformer graph */
+int iris_gpu_linear_fp8_bf16_into(iris_gpu_tensor_t out,
+                                  iris_gpu_tensor_t x,
+                                  const uint8_t *weights,
+                                  size_t weight_elements,
+                                  size_t weight_offset,
+                                  float weight_scale,
+                                  int seq_len, int in_dim, int out_dim);
+int iris_gpu_linear_fp8_qkv_bf16_into(iris_gpu_tensor_t q,
+                                      iris_gpu_tensor_t k,
+                                      iris_gpu_tensor_t v,
+                                      iris_gpu_tensor_t x,
+                                      const uint8_t *weights,
+                                      size_t weight_elements,
+                                      size_t weight_offset,
+                                      float weight_scale,
+                                      int seq_len, int in_dim, int out_dim);
+int iris_gpu_linear_fp8_gate_up_bf16_into(iris_gpu_tensor_t gate,
+                                          iris_gpu_tensor_t up,
+                                          iris_gpu_tensor_t x,
+                                          const uint8_t *gate_weights,
+                                          size_t gate_elements,
+                                          size_t gate_offset,
+                                          float gate_scale,
+                                          const uint8_t *up_weights,
+                                          size_t up_elements,
+                                          size_t up_offset,
+                                          float up_scale,
+                                          int seq_len, int in_dim,
+                                          int out_dim);
+void iris_gpu_rms_norm_bf16_f32_weight(iris_gpu_tensor_t out,
+                                       iris_gpu_tensor_t x,
+                                       const float *weight,
+                                       int seq, int hidden, float eps);
+void iris_gpu_qk_rms_norm_bf16_f32_weight(iris_gpu_tensor_t q,
+                                          iris_gpu_tensor_t k,
+                                          const float *q_weight,
+                                          const float *k_weight,
+                                          int seq, int heads, int head_dim,
+                                          float eps);
+void iris_gpu_rope_pair_bf16(iris_gpu_tensor_t q,
+                             iris_gpu_tensor_t k,
+                             const float *cos_freq,
+                             const float *sin_freq,
+                             int seq, int heads, int head_dim);
+void iris_gpu_gated_add_bf16_f32_gate(iris_gpu_tensor_t out,
+                                      const float *gate,
+                                      iris_gpu_tensor_t projection,
+                                      int seq, int hidden);
 #endif
 
 /*
@@ -572,6 +622,11 @@ void iris_gpu_copy_f32(iris_gpu_tensor_t dst, iris_gpu_tensor_t src, size_t n);
 
 /* GPU blit copy for f32 tensors with element offsets */
 void iris_gpu_copy_region_f32(iris_gpu_tensor_t dst, size_t dst_offset,
+                               iris_gpu_tensor_t src, size_t src_offset,
+                               size_t n);
+
+/* GPU blit copy for BF16 tensors with element offsets */
+void iris_gpu_copy_region_bf16(iris_gpu_tensor_t dst, size_t dst_offset,
                                iris_gpu_tensor_t src, size_t src_offset,
                                size_t n);
 

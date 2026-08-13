@@ -1,0 +1,98 @@
+#version 460
+#extension GL_EXT_bfloat16 : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#define ROW_TILES 4u
+#define PROJECTIONS 3u
+layout(local_size_x = 384) in;
+layout(set = 0, binding = 0, std430) readonly buffer XBuffer { uint x[]; };
+layout(set = 0, binding = 1, std430) readonly buffer WeightBuffer { uint weight[]; };
+layout(set = 0, binding = 2, std430) buffer QBuffer { uint q[]; };
+layout(set = 0, binding = 3, std430) buffer KBuffer { uint k[]; };
+layout(set = 0, binding = 4, std430) buffer VBuffer { uint v[]; };
+layout(push_constant) uniform Push { uint p[4]; } pc;
+shared bfloat16_t x_tile[ROW_TILES * 256u];
+shared bfloat16_t weight_tile[PROJECTIONS * 256u];
+shared float output_tile[ROW_TILES * PROJECTIONS * 256u];
+
+float decode_bf16(uint packed, uint index) {
+    uint bits = (index & 1u) == 0u ? packed & 0xffffu : packed >> 16u;
+    return uintBitsToFloat(bits << 16u);
+}
+uint encode_bf16(float value) {
+    uint bits = floatBitsToUint(value);
+    bits += 0x7fffu + ((bits >> 16u) & 1u);
+    return bits >> 16u;
+}
+void main() {
+    // Map twelve subgroups across four row tiles and three projections
+    uint local_index = gl_LocalInvocationID.x;
+    uint lane = gl_SubgroupInvocationID;
+    uint subgroup = gl_SubgroupID;
+    uint row_tile = subgroup / PROJECTIONS;
+    uint projection = subgroup - row_tile * PROJECTIONS;
+    uint tile_row = (gl_WorkGroupID.y * ROW_TILES + row_tile) * 16u + pc.p[3];
+    uint tile_col = gl_WorkGroupID.x * 16u;
+    uint rows = pc.p[0], inner = pc.p[1], cols = pc.p[2];
+    uint matrix_elements = cols * inner;
+    coopmat<bfloat16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matrix_a;
+    coopmat<bfloat16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> matrix_b;
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> accumulator =
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    for (uint base = 0u; base < inner; base += 16u) {
+        for (uint element = local_index; element < ROW_TILES * 256u;
+             element += gl_WorkGroupSize.x) {
+            uint tile_element = element & 255u;
+            uint tile = element >> 8u;
+            uint inner_index = tile_element & 15u;
+            uint outer = tile_element >> 4u;
+            uint row = (gl_WorkGroupID.y * ROW_TILES + tile) * 16u +
+                       pc.p[3] + outer;
+            uint source = row * inner + base + inner_index;
+            x_tile[element] = bfloat16_t(row < rows
+                ? decode_bf16(x[source >> 1u], source) : 0.0);
+        }
+        for (uint element = local_index; element < PROJECTIONS * 256u;
+             element += gl_WorkGroupSize.x) {
+            uint tile_element = element & 255u;
+            uint matrix = element >> 8u;
+            uint inner_index = tile_element & 15u;
+            uint outer = tile_element >> 4u;
+            uint col = tile_col + outer;
+            uint source = matrix * matrix_elements + col * inner +
+                          base + inner_index;
+            weight_tile[matrix * 256u + inner_index * 16u + outer] =
+                bfloat16_t(col < cols
+                ? decode_bf16(weight[source >> 1u], source) : 0.0);
+        }
+        barrier();
+        coopMatLoad(matrix_a, x_tile, row_tile * 256u, 16u,
+                    gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(matrix_b, weight_tile, projection * 256u, 16u,
+                    gl_CooperativeMatrixLayoutRowMajor);
+        accumulator = coopMatMulAdd(matrix_a, matrix_b, accumulator);
+        barrier();
+    }
+    coopMatStore(accumulator, output_tile, subgroup * 256u, 16u,
+                 gl_CooperativeMatrixLayoutRowMajor);
+    barrier();
+
+    // Pack each projection into its independent output tensor
+    for (uint pair = lane; pair < 128u; pair += 32u) {
+        uint element = pair * 2u;
+        uint local_row = element >> 4u;
+        uint local_col = element & 15u;
+        uint row = tile_row + local_row;
+        uint col = tile_col + local_col;
+        if (row < rows && col < cols) {
+            uint low = encode_bf16(output_tile[subgroup * 256u + element]);
+            uint high = col + 1u < cols
+                ? encode_bf16(output_tile[subgroup * 256u + element + 1u]) : 0u;
+            uint packed_index = (row * cols + col) >> 1u;
+            if (projection == 0u) q[packed_index] = low | (high << 16u);
+            else if (projection == 1u) k[packed_index] = low | (high << 16u);
+            else v[packed_index] = low | (high << 16u);
+        }
+    }
+}

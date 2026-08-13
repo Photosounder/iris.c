@@ -1,0 +1,39 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 32) in;
+layout(set = 0, binding = 0, std430) readonly buffer XBuffer { uint x[]; };
+layout(set = 0, binding = 1, std430) readonly buffer WeightBuffer { float weight[]; };
+layout(set = 0, binding = 2, std430) buffer OutputBuffer { uint output_data[]; };
+layout(push_constant) uniform Push { uint p[3]; } pc;
+float decode(uint packed, uint index) {
+    uint bits = (index & 1u) == 0u ? packed & 0xffffu : packed >> 16u;
+    return uintBitsToFloat(bits << 16u);
+}
+uint encode(float value) {
+    uint bits = floatBitsToUint(value);
+    bits += 0x7fffu + ((bits >> 16u) & 1u);
+    return bits >> 16u;
+}
+void main() {
+    // Normalize one packed-BF16 row with FP32 accumulation and weights
+    uint lane = gl_LocalInvocationID.x;
+    uint row = gl_WorkGroupID.x;
+    uint hidden = pc.p[1];
+    float sum = 0.0;
+    for (uint index = lane; index < hidden; index += 32u) {
+        uint source = row * hidden + index;
+        float value = decode(x[source >> 1u], source);
+        sum += value * value;
+    }
+    float inverse_rms = inversesqrt(subgroupAdd(sum) / float(hidden) +
+                                     uintBitsToFloat(pc.p[2]));
+    for (uint pair = lane; pair * 2u < hidden; pair += 32u) {
+        uint index = pair * 2u;
+        uint base = row * hidden + index;
+        uint low = encode(decode(x[base >> 1u], base) * inverse_rms * weight[index]);
+        uint high = index + 1u < hidden
+            ? encode(decode(x[(base + 1u) >> 1u], base + 1u) *
+                     inverse_rms * weight[index + 1u]) : 0u;
+        output_data[base >> 1u] = low | (high << 16u);
+    }
+}

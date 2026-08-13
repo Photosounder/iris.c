@@ -38,7 +38,6 @@ void main() {
             uint inner_index = element & 15u;
             uint outer = element >> 4u;
             uint row = tile_row + outer;
-            uint col = tile_col + outer;
             x_tile[row_tile * 256u + element] = bfloat16_t(row < rows
                 ? x[row * inner + base + inner_index] : 0.0);
         }
@@ -52,7 +51,8 @@ void main() {
         barrier();
         coopMatLoad(matrix_a, x_tile, row_tile * 256u, 16u,
                     gl_CooperativeMatrixLayoutRowMajor);
-        coopMatLoad(matrix_b, weight_tile, 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(matrix_b, weight_tile, 0u, 16u,
+                    gl_CooperativeMatrixLayoutRowMajor);
         accumulator = coopMatMulAdd(matrix_a, matrix_b, accumulator);
         barrier();
     }

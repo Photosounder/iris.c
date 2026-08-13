@@ -1,0 +1,101 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#define QUERY_TILE 8u
+#define KEY_TILE 16u
+#define MAX_HEAD_DIM 128u
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) readonly buffer QBuffer { uint q[]; };
+layout(set = 0, binding = 1, std430) readonly buffer KBuffer { uint k[]; };
+layout(set = 0, binding = 2, std430) readonly buffer VBuffer { uint v[]; };
+layout(set = 0, binding = 3, std430) buffer OutputBuffer { uint output_data[]; };
+layout(push_constant) uniform Push { uint p[6]; } pc;
+shared float key_tile[KEY_TILE * MAX_HEAD_DIM];
+shared float value_tile[KEY_TILE * MAX_HEAD_DIM];
+float decode(uint packed, uint index) {
+    uint bits = (index & 1u) == 0u ? packed & 0xffffu : packed >> 16u;
+    return uintBitsToFloat(bits << 16u);
+}
+uint encode(float value) {
+    uint bits = floatBitsToUint(value);
+    bits += 0x7fffu + ((bits >> 16u) & 1u);
+    return bits >> 16u;
+}
+void main() {
+    // Assign one query to each subgroup and retain FP32 softmax state
+    uint local_index = gl_LocalInvocationID.x;
+    uint lane = gl_SubgroupInvocationID;
+    uint query_in_tile = gl_SubgroupID;
+    uint group = gl_WorkGroupID.x;
+    uint seq_q = pc.p[0], seq_k = pc.p[1];
+    uint heads = pc.p[2], head_dim = pc.p[3];
+    uint hidden = heads * head_dim;
+    uint query_block = group / heads;
+    uint head = group - query_block * heads;
+    uint query = pc.p[5] + query_block * QUERY_TILE + query_in_tile;
+    uint component = lane * 4u;
+    float scale = uintBitsToFloat(pc.p[4]);
+    bool valid_query = query < seq_q && query_in_tile < QUERY_TILE;
+    uint query_base = query * hidden + head * head_dim;
+    float query_values[4], accumulated[4];
+    for (uint part = 0u; part < 4u; part++) {
+        uint index = component + part;
+        uint source = query_base + index;
+        query_values[part] = valid_query && index < head_dim
+            ? decode(q[source >> 1u], source) : 0.0;
+        accumulated[part] = 0.0;
+    }
+    float maximum = -3.402823466e+38;
+    float denominator = 0.0;
+    for (uint key_start = 0u; key_start < seq_k; key_start += KEY_TILE) {
+        for (uint linear = local_index; linear < KEY_TILE * MAX_HEAD_DIM;
+             linear += gl_WorkGroupSize.x) {
+            uint key_in_tile = linear / MAX_HEAD_DIM;
+            uint dimension = linear - key_in_tile * MAX_HEAD_DIM;
+            uint key_index = key_start + key_in_tile;
+            float key_value = 0.0, value = 0.0;
+            if (key_index < seq_k && dimension < head_dim) {
+                uint source = key_index * hidden + head * head_dim + dimension;
+                key_value = decode(k[source >> 1u], source);
+                value = decode(v[source >> 1u], source);
+            }
+            key_tile[linear] = key_value;
+            value_tile[linear] = value;
+        }
+        barrier();
+        uint available = min(KEY_TILE, seq_k - key_start);
+        for (uint key_in_tile = 0u; key_in_tile < available; key_in_tile++) {
+            float partial_dot = 0.0;
+            for (uint part = 0u; part < 4u; part++) {
+                uint index = component + part;
+                if (valid_query && index < head_dim)
+                    partial_dot += query_values[part] *
+                        key_tile[key_in_tile * MAX_HEAD_DIM + index];
+            }
+            float score = subgroupAdd(partial_dot) * scale;
+            float new_maximum = max(maximum, score);
+            float rescale = exp(maximum - new_maximum);
+            float probability = exp(score - new_maximum);
+            denominator = denominator * rescale + probability;
+            maximum = new_maximum;
+            for (uint part = 0u; part < 4u; part++) {
+                uint index = component + part;
+                if (valid_query && index < head_dim)
+                    accumulated[part] = accumulated[part] * rescale +
+                        probability * value_tile[key_in_tile * MAX_HEAD_DIM + index];
+            }
+        }
+        barrier();
+    }
+    // Pack each subgroup's independent output components
+    if (valid_query) {
+        for (uint pair = 0u; pair < 2u; pair++) {
+            uint index = component + pair * 2u;
+            if (index < head_dim) {
+                uint low = encode(accumulated[pair * 2u] / denominator);
+                uint high = encode(accumulated[pair * 2u + 1u] / denominator);
+                output_data[(query_base + index) >> 1u] = low | (high << 16u);
+            }
+        }
+    }
+}

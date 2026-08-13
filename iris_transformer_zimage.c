@@ -317,6 +317,114 @@ static int zi_gpu_scratch_init(zi_gpu_scratch_t *s, int seq, int dim, int ffn_di
     return 1;
 }
 
+#ifdef USE_VULKAN
+typedef struct {
+    int seq, dim, ffn_dim;
+    iris_gpu_tensor_t norm;
+    iris_gpu_tensor_t q;
+    iris_gpu_tensor_t k;
+    iris_gpu_tensor_t v;
+    iris_gpu_tensor_t attn_out;
+    iris_gpu_tensor_t proj;
+    iris_gpu_tensor_t norm2;
+    iris_gpu_tensor_t gate_up;
+    iris_gpu_tensor_t up;
+    iris_gpu_tensor_t down;
+    float *mod;
+    float *fused_attn_norm;
+    float *fused_ffn_norm;
+} zi_gpu_bf16_scratch_t;
+
+static void zi_gpu_bf16_scratch_free(zi_gpu_bf16_scratch_t *s) {
+    if (!s) return;
+    /* Release the compact BF16 activation workspace */
+    if (s->norm) iris_gpu_tensor_free(s->norm);
+    if (s->q) iris_gpu_tensor_free(s->q);
+    if (s->k) iris_gpu_tensor_free(s->k);
+    if (s->v) iris_gpu_tensor_free(s->v);
+    if (s->attn_out) iris_gpu_tensor_free(s->attn_out);
+    if (s->proj) iris_gpu_tensor_free(s->proj);
+    if (s->norm2) iris_gpu_tensor_free(s->norm2);
+    if (s->gate_up) iris_gpu_tensor_free(s->gate_up);
+    if (s->up) iris_gpu_tensor_free(s->up);
+    if (s->down) iris_gpu_tensor_free(s->down);
+    free(s->mod);
+    free(s->fused_attn_norm);
+    free(s->fused_ffn_norm);
+    memset(s, 0, sizeof(*s));
+}
+
+static int zi_gpu_bf16_scratch_init(zi_gpu_bf16_scratch_t *s,
+                                    int seq, int dim, int ffn_dim) {
+    memset(s, 0, sizeof(*s));
+    s->seq = seq;
+    s->dim = dim;
+    s->ffn_dim = ffn_dim;
+
+    /* Allocate every transformer activation in native BF16 storage */
+    s->norm = iris_gpu_tensor_alloc_f16((size_t)seq * dim);
+    s->q = iris_gpu_tensor_alloc_f16((size_t)seq * dim);
+    s->k = iris_gpu_tensor_alloc_f16((size_t)seq * dim);
+    s->v = iris_gpu_tensor_alloc_f16((size_t)seq * dim);
+    s->attn_out = iris_gpu_tensor_alloc_f16((size_t)seq * dim);
+    s->proj = iris_gpu_tensor_alloc_f16((size_t)seq * dim);
+    s->norm2 = iris_gpu_tensor_alloc_f16((size_t)seq * dim);
+    s->gate_up = iris_gpu_tensor_alloc_f16((size_t)seq * ffn_dim);
+    s->up = iris_gpu_tensor_alloc_f16((size_t)seq * ffn_dim);
+    s->down = iris_gpu_tensor_alloc_f16((size_t)seq * dim);
+    if (!s->norm || !s->q || !s->k || !s->v || !s->attn_out ||
+        !s->proj || !s->norm2 || !s->gate_up || !s->up || !s->down) {
+        zi_gpu_bf16_scratch_free(s);
+        return 0;
+    }
+
+    /* Keep modulation and fused affine vectors in FP32 for numerical stability */
+    s->mod = (float *)malloc(4u * (size_t)dim * sizeof(float));
+    s->fused_attn_norm = (float *)malloc((size_t)dim * sizeof(float));
+    s->fused_ffn_norm = (float *)malloc((size_t)dim * sizeof(float));
+    if (!s->mod || !s->fused_attn_norm || !s->fused_ffn_norm) {
+        zi_gpu_bf16_scratch_free(s);
+        return 0;
+    }
+    return 1;
+}
+#endif
+
+typedef struct {
+    zi_gpu_scratch_t f32;
+#ifdef USE_VULKAN
+    zi_gpu_bf16_scratch_t bf16;
+    int use_bf16;
+#endif
+} zi_gpu_graph_scratch_t;
+
+static int zi_gpu_graph_scratch_init(zi_gpu_graph_scratch_t *s,
+                                     int use_bf16, int seq, int dim,
+                                     int ffn_dim) {
+    memset(s, 0, sizeof(*s));
+#ifdef USE_VULKAN
+    /* Select the compact graph only for the fully supported FP8 model path */
+    s->use_bf16 = use_bf16;
+    if (s->use_bf16)
+        return zi_gpu_bf16_scratch_init(&s->bf16, seq, dim, ffn_dim);
+#else
+    (void)use_bf16;
+#endif
+    return zi_gpu_scratch_init(&s->f32, seq, dim, ffn_dim);
+}
+
+static void zi_gpu_graph_scratch_free(zi_gpu_graph_scratch_t *s) {
+    if (!s) return;
+#ifdef USE_VULKAN
+    /* Release the workspace matching the active graph precision */
+    if (s->use_bf16) {
+        zi_gpu_bf16_scratch_free(&s->bf16);
+        return;
+    }
+#endif
+    zi_gpu_scratch_free(&s->f32);
+}
+
 static void zi_build_rope_table(float *cos_out, float *sin_out,
                                  const int *pos_ids, int seq,
                                  zi_transformer_t *tf);
@@ -1235,6 +1343,163 @@ static int zi_block_forward_gpu(iris_gpu_tensor_t hidden_gpu,
     return 1;
 }
 
+#ifdef USE_VULKAN
+static int zi_block_forward_gpu_bf16(iris_gpu_tensor_t hidden_gpu,
+                                     const zi_block_t *block,
+                                     const float *rope_cos,
+                                     const float *rope_sin,
+                                     const float *t_emb,
+                                     const float *precomputed_mod,
+                                     int seq, zi_transformer_t *tf,
+                                     zi_gpu_bf16_scratch_t *scratch) {
+    if (!hidden_gpu || !block || !scratch || !tf->fp8_weights) return 0;
+    int dim = tf->dim;
+    int heads = tf->n_heads;
+    int head_dim = tf->head_dim;
+    int ffn_dim = tf->ffn_dim;
+    size_t qkv_matrix = (size_t)dim * (size_t)dim;
+
+    /* Compute or reuse the four modulation vectors for this block */
+    const float *mod = precomputed_mod;
+    if (block->adaln_weight && !mod) {
+        iris_matmul_t(scratch->mod, t_emb, block->adaln_weight,
+                      1, tf->adaln_dim, 4 * dim);
+        for (int i = 0; i < 4 * dim; i++)
+            scratch->mod[i] += block->adaln_bias[i];
+        for (int i = 0; i < dim; i++) {
+            scratch->mod[i] = 1.0f + scratch->mod[i];
+            scratch->mod[dim + i] = tanhf(scratch->mod[dim + i]);
+            scratch->mod[2 * dim + i] = 1.0f + scratch->mod[2 * dim + i];
+            scratch->mod[3 * dim + i] = tanhf(scratch->mod[3 * dim + i]);
+        }
+        mod = scratch->mod;
+    }
+    const float *gate_msa = mod ? mod + dim : NULL;
+    const float *gate_mlp = mod ? mod + 3 * dim : NULL;
+
+    /* Fold attention modulation into the FP32 RMSNorm affine vector */
+    const float *attn_norm = block->attn_norm1;
+    if (mod) {
+        for (int i = 0; i < dim; i++)
+            scratch->fused_attn_norm[i] = block->attn_norm1[i] * mod[i];
+        attn_norm = scratch->fused_attn_norm;
+    }
+    iris_gpu_rms_norm_bf16_f32_weight(scratch->norm, hidden_gpu,
+                                       attn_norm, seq, dim, ZI_NORM_EPS);
+
+    /* Fuse contiguous QKV projections and share each activation tile */
+    int qkv_contiguous = block->attn_q_fp8.data &&
+        block->attn_q_fp8.data == block->attn_k_fp8.data &&
+        block->attn_q_fp8.data == block->attn_v_fp8.data &&
+        block->attn_q_fp8.elements == block->attn_k_fp8.elements &&
+        block->attn_q_fp8.elements == block->attn_v_fp8.elements &&
+        block->attn_k_fp8.offset == block->attn_q_fp8.offset + qkv_matrix &&
+        block->attn_v_fp8.offset == block->attn_q_fp8.offset + 2u * qkv_matrix &&
+        block->attn_q_fp8.scale == block->attn_k_fp8.scale &&
+        block->attn_q_fp8.scale == block->attn_v_fp8.scale;
+    if (qkv_contiguous) {
+        if (!iris_gpu_linear_fp8_qkv_bf16_into(
+                scratch->q, scratch->k, scratch->v, scratch->norm,
+                block->attn_q_fp8.data, block->attn_q_fp8.elements,
+                block->attn_q_fp8.offset, block->attn_q_fp8.scale,
+                seq, dim, dim)) return 0;
+    } else {
+        if (!iris_gpu_linear_fp8_bf16_into(
+                scratch->q, scratch->norm, block->attn_q_fp8.data,
+                block->attn_q_fp8.elements, block->attn_q_fp8.offset,
+                block->attn_q_fp8.scale, seq, dim, dim) ||
+            !iris_gpu_linear_fp8_bf16_into(
+                scratch->k, scratch->norm, block->attn_k_fp8.data,
+                block->attn_k_fp8.elements, block->attn_k_fp8.offset,
+                block->attn_k_fp8.scale, seq, dim, dim) ||
+            !iris_gpu_linear_fp8_bf16_into(
+                scratch->v, scratch->norm, block->attn_v_fp8.data,
+                block->attn_v_fp8.elements, block->attn_v_fp8.offset,
+                block->attn_v_fp8.scale, seq, dim, dim)) return 0;
+    }
+
+    /* Keep normalization, RoPE, and attention output entirely in BF16 */
+    iris_gpu_qk_rms_norm_bf16_f32_weight(
+        scratch->q, scratch->k, block->attn_norm_q, block->attn_norm_k,
+        seq, heads, head_dim, ZI_NORM_EPS);
+    iris_gpu_rope_pair_bf16(scratch->q, scratch->k, rope_cos, rope_sin,
+                            seq, heads, head_dim);
+    float attn_scale = 1.0f / sqrtf((float)head_dim);
+    if (!iris_gpu_attention_fused_bf16(
+            scratch->attn_out, scratch->q, scratch->k, scratch->v,
+            seq, seq, heads, head_dim, attn_scale)) return 0;
+    if (!iris_gpu_linear_fp8_bf16_into(
+            scratch->proj, scratch->attn_out, block->attn_out_fp8.data,
+            block->attn_out_fp8.elements, block->attn_out_fp8.offset,
+            block->attn_out_fp8.scale, seq, dim, dim)) return 0;
+
+    /* Normalize the attention result before its gated residual update */
+    iris_gpu_rms_norm_bf16_f32_weight(
+        scratch->norm2, scratch->proj, block->attn_norm2,
+        seq, dim, ZI_NORM_EPS);
+    if (gate_msa)
+        iris_gpu_gated_add_bf16_f32_gate(
+            hidden_gpu, gate_msa, scratch->norm2, seq, dim);
+    else
+        iris_gpu_add_bf16(hidden_gpu, hidden_gpu, scratch->norm2, seq * dim);
+
+    /* Fold FFN modulation into the FP32 RMSNorm affine vector */
+    const float *ffn_norm = block->ffn_norm1;
+    if (mod) {
+        for (int i = 0; i < dim; i++)
+            scratch->fused_ffn_norm[i] = block->ffn_norm1[i] * mod[2 * dim + i];
+        ffn_norm = scratch->fused_ffn_norm;
+    }
+    iris_gpu_rms_norm_bf16_f32_weight(
+        scratch->norm, hidden_gpu, ffn_norm, seq, dim, ZI_NORM_EPS);
+
+    /* Fuse gate and up projections before the in-place SwiGLU activation */
+    if (!iris_gpu_linear_fp8_gate_up_bf16_into(
+            scratch->gate_up, scratch->up, scratch->norm,
+            block->ffn_w1_fp8.data, block->ffn_w1_fp8.elements,
+            block->ffn_w1_fp8.offset, block->ffn_w1_fp8.scale,
+            block->ffn_w3_fp8.data, block->ffn_w3_fp8.elements,
+            block->ffn_w3_fp8.offset, block->ffn_w3_fp8.scale,
+            seq, dim, ffn_dim)) return 0;
+    iris_gpu_silu_mul_bf16(scratch->gate_up, scratch->up, seq * ffn_dim);
+    if (!iris_gpu_linear_fp8_bf16_into(
+            scratch->down, scratch->gate_up, block->ffn_w2_fp8.data,
+            block->ffn_w2_fp8.elements, block->ffn_w2_fp8.offset,
+            block->ffn_w2_fp8.scale, seq, ffn_dim, dim)) return 0;
+
+    /* Normalize the FFN result before its final residual update */
+    iris_gpu_rms_norm_bf16_f32_weight(
+        scratch->norm2, scratch->down, block->ffn_norm2,
+        seq, dim, ZI_NORM_EPS);
+    if (gate_mlp)
+        iris_gpu_gated_add_bf16_f32_gate(
+            hidden_gpu, gate_mlp, scratch->norm2, seq, dim);
+    else
+        iris_gpu_add_bf16(hidden_gpu, hidden_gpu, scratch->norm2, seq * dim);
+    return 1;
+}
+#endif
+
+static int zi_block_forward_gpu_graph(iris_gpu_tensor_t hidden_gpu,
+                                      const zi_block_t *block,
+                                      const float *rope_cos,
+                                      const float *rope_sin,
+                                      const float *t_emb,
+                                      const float *precomputed_mod,
+                                      int seq, zi_transformer_t *tf,
+                                      zi_gpu_graph_scratch_t *scratch) {
+#ifdef USE_VULKAN
+    /* Route FP8 models through the end-to-end BF16 transformer graph */
+    if (scratch->use_bf16)
+        return zi_block_forward_gpu_bf16(
+            hidden_gpu, block, rope_cos, rope_sin, t_emb,
+            precomputed_mod, seq, tf, &scratch->bf16);
+#endif
+    return zi_block_forward_gpu(
+        hidden_gpu, block, rope_cos, rope_sin, t_emb,
+        precomputed_mod, seq, tf, &scratch->f32);
+}
+
 /* Precompute modulation for one block:
  * mod_out layout = [scale_msa, gate_msa, scale_mlp, gate_mlp], each dim.
  * Scales are stored as (1 + scale), gates are tanh(gate). */
@@ -1422,12 +1687,40 @@ static float *zi_transformer_forward_gpu(zi_transformer_t *tf,
         if (cap_gpu) iris_gpu_tensor_free(cap_gpu);
         return NULL;
     }
+#ifdef USE_VULKAN
+    int use_bf16_graph = tf->fp8_weights;
+    if (use_bf16_graph) {
+        /* Convert embeddings once at the transformer graph boundary */
+        iris_gpu_tensor_t img_bf16 = iris_gpu_tensor_f32_to_bf16(img_gpu);
+        iris_gpu_tensor_t cap_bf16 = iris_gpu_tensor_f32_to_bf16(cap_gpu);
+        if (!img_bf16 || !cap_bf16) {
+            if (img_bf16) iris_gpu_tensor_free(img_bf16);
+            if (cap_bf16) iris_gpu_tensor_free(cap_bf16);
+            iris_gpu_tensor_free(img_gpu);
+            iris_gpu_tensor_free(cap_gpu);
+            return NULL;
+        }
+        iris_gpu_tensor_free(img_gpu);
+        iris_gpu_tensor_free(cap_gpu);
+        img_gpu = img_bf16;
+        cap_gpu = cap_bf16;
+        /* Report the selected graph once rather than once per denoising step */
+        static int bf16_graph_reported;
+        if (!bf16_graph_reported) {
+            fprintf(stderr, "Vulkan Z-Image activations: end-to-end BF16, fused QKV/SwiGLU\n");
+            bf16_graph_reported = 1;
+        }
+    }
+#else
+    int use_bf16_graph = 0;
+#endif
     iris_gpu_tensor_set_persistent(img_gpu, 1);
     iris_gpu_tensor_set_persistent(cap_gpu, 1);
 
     /* Allocate scratch for max sequence length (unified_seq) */
-    zi_gpu_scratch_t scratch;
-    if (!zi_gpu_scratch_init(&scratch, unified_seq, dim, tf->ffn_dim)) {
+    zi_gpu_graph_scratch_t scratch;
+    if (!zi_gpu_graph_scratch_init(&scratch, use_bf16_graph,
+                                   unified_seq, dim, tf->ffn_dim)) {
         iris_gpu_tensor_free(img_gpu);
         iris_gpu_tensor_free(cap_gpu);
         return NULL;
@@ -1469,9 +1762,9 @@ static float *zi_transformer_forward_gpu(zi_transformer_t *tf,
     for (int i = 0; i < tf->n_refiner && gpu_ok; i++) {
         const float *block_mod = step_mod ? (step_mod + (size_t)mod_idx * 4 * dim) : NULL;
         mod_idx++;
-        gpu_ok = zi_block_forward_gpu(img_gpu, &tf->noise_refiner[i],
-                                       img_rope_cos, img_rope_sin,
-                                       t_emb, block_mod, img_padded, tf, &scratch);
+        gpu_ok = zi_block_forward_gpu_graph(
+            img_gpu, &tf->noise_refiner[i], img_rope_cos, img_rope_sin,
+            t_emb, block_mod, img_padded, tf, &scratch);
 #ifdef USE_VULKAN
         /* Submit each block separately to stay below the Windows GPU watchdog */
         if (gpu_ok) {
@@ -1487,9 +1780,9 @@ static float *zi_transformer_forward_gpu(zi_transformer_t *tf,
     /* === Context refiner: 2 unmodulated blocks on caption tokens === */
     stage_start = zi_time_ms();
     for (int i = 0; i < tf->n_refiner && gpu_ok; i++) {
-        gpu_ok = zi_block_forward_gpu(cap_gpu, &tf->context_refiner[i],
-                                       cap_rope_cos, cap_rope_sin,
-                                       NULL, NULL, cap_padded, tf, &scratch);
+        gpu_ok = zi_block_forward_gpu_graph(
+            cap_gpu, &tf->context_refiner[i], cap_rope_cos, cap_rope_sin,
+            NULL, NULL, cap_padded, tf, &scratch);
 #ifdef USE_VULKAN
         /* Submit each block separately to stay below the Windows GPU watchdog */
         if (gpu_ok) {
@@ -1504,7 +1797,7 @@ static float *zi_transformer_forward_gpu(zi_transformer_t *tf,
 
     if (!gpu_ok) {
         iris_gpu_batch_end();
-        zi_gpu_scratch_free(&scratch);
+        zi_gpu_graph_scratch_free(&scratch);
         free(step_mod);
         iris_gpu_tensor_free(img_gpu);
         iris_gpu_tensor_free(cap_gpu);
@@ -1512,10 +1805,12 @@ static float *zi_transformer_forward_gpu(zi_transformer_t *tf,
     }
 
     /* === Concatenate: unified = [img, cap] === */
-    iris_gpu_tensor_t unified_gpu = iris_gpu_tensor_alloc(unified_seq * dim);
+    iris_gpu_tensor_t unified_gpu = use_bf16_graph
+        ? iris_gpu_tensor_alloc_f16((size_t)unified_seq * dim)
+        : iris_gpu_tensor_alloc((size_t)unified_seq * dim);
     if (!unified_gpu) {
         iris_gpu_batch_end();
-        zi_gpu_scratch_free(&scratch);
+        zi_gpu_graph_scratch_free(&scratch);
         free(step_mod);
         iris_gpu_tensor_free(img_gpu);
         iris_gpu_tensor_free(cap_gpu);
@@ -1526,8 +1821,14 @@ static float *zi_transformer_forward_gpu(zi_transformer_t *tf,
     /* Copy img then cap into unified entirely on GPU (no CPU sync). */
     size_t img_elems = (size_t)img_padded * dim;
     size_t cap_elems = (size_t)cap_padded * dim;
-    iris_gpu_copy_region_f32(unified_gpu, 0, img_gpu, 0, img_elems);
-    iris_gpu_copy_region_f32(unified_gpu, img_elems, cap_gpu, 0, cap_elems);
+    if (use_bf16_graph) {
+        /* Concatenate image and caption tokens without widening BF16 storage */
+        iris_gpu_copy_region_bf16(unified_gpu, 0, img_gpu, 0, img_elems);
+        iris_gpu_copy_region_bf16(unified_gpu, img_elems, cap_gpu, 0, cap_elems);
+    } else {
+        iris_gpu_copy_region_f32(unified_gpu, 0, img_gpu, 0, img_elems);
+        iris_gpu_copy_region_f32(unified_gpu, img_elems, cap_gpu, 0, cap_elems);
+    }
 
     iris_gpu_tensor_free(img_gpu);
     iris_gpu_tensor_free(cap_gpu);
@@ -1537,9 +1838,9 @@ static float *zi_transformer_forward_gpu(zi_transformer_t *tf,
     for (int i = 0; i < tf->n_layers && gpu_ok; i++) {
         const float *block_mod = step_mod ? (step_mod + (size_t)mod_idx * 4 * dim) : NULL;
         mod_idx++;
-        gpu_ok = zi_block_forward_gpu(unified_gpu, &tf->layers[i],
-                                       uni_rope_cos, uni_rope_sin,
-                                       t_emb, block_mod, unified_seq, tf, &scratch);
+        gpu_ok = zi_block_forward_gpu_graph(
+            unified_gpu, &tf->layers[i], uni_rope_cos, uni_rope_sin,
+            t_emb, block_mod, unified_seq, tf, &scratch);
 #ifdef USE_VULKAN
         /* Submit each block separately to stay below the Windows GPU watchdog */
         if (gpu_ok) {
@@ -1554,7 +1855,7 @@ static float *zi_transformer_forward_gpu(zi_transformer_t *tf,
 
     if (!gpu_ok) {
         iris_gpu_batch_end();
-        zi_gpu_scratch_free(&scratch);
+        zi_gpu_graph_scratch_free(&scratch);
         free(step_mod);
         iris_gpu_tensor_free(unified_gpu);
         return NULL;
@@ -1569,14 +1870,26 @@ static float *zi_transformer_forward_gpu(zi_transformer_t *tf,
     float *img_hidden = (float *)malloc(unified_hidden_count * sizeof(float));
     if (!img_hidden) {
         free(img_hidden);
-        zi_gpu_scratch_free(&scratch);
+        zi_gpu_graph_scratch_free(&scratch);
         free(step_mod);
         iris_gpu_tensor_free(unified_gpu);
         return NULL;
     }
-    /* Stage the complete device-local tensor before using its image-token prefix */
-    iris_gpu_tensor_read(unified_gpu, img_hidden);
-    zi_gpu_scratch_free(&scratch);
+    /* Widen once at the final graph boundary for the exact CPU final layer */
+    iris_gpu_tensor_t readback_gpu = unified_gpu;
+    if (use_bf16_graph) {
+        readback_gpu = iris_gpu_tensor_bf16_to_f32(unified_gpu);
+        if (!readback_gpu) {
+            free(img_hidden);
+            zi_gpu_graph_scratch_free(&scratch);
+            free(step_mod);
+            iris_gpu_tensor_free(unified_gpu);
+            return NULL;
+        }
+    }
+    iris_gpu_tensor_read(readback_gpu, img_hidden);
+    if (readback_gpu != unified_gpu) iris_gpu_tensor_free(readback_gpu);
+    zi_gpu_graph_scratch_free(&scratch);
     free(step_mod);
     iris_gpu_tensor_free(unified_gpu);
 

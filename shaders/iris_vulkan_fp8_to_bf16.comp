@@ -3,7 +3,7 @@
 layout(local_size_x = 256) in;
 layout(set = 0, binding = 0, std430) readonly buffer InputBuffer { uint input_data[]; };
 layout(set = 0, binding = 1, std430) buffer OutputBuffer { uint output_data[]; };
-layout(push_constant) uniform Push { uint p[3]; } pc;
+layout(push_constant) uniform Push { uint p[4]; } pc;
 
 float load_fp8(uint index) {
     uint packed = input_data[index >> 2u];
@@ -36,5 +36,5 @@ void main() {
     uint low = encode_bf16(load_fp8(pc.p[0] + first) * scale);
     uint high = first + 1u < elements
         ? encode_bf16(load_fp8(pc.p[0] + first + 1u) * scale) : 0u;
-    output_data[pair] = low | (high << 16u);
+    output_data[pc.p[3] / 2u + pair] = low | (high << 16u);
 }

@@ -1,0 +1,29 @@
+#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) buffer OutputBuffer { uint output_data[]; };
+layout(set = 0, binding = 1, std430) readonly buffer GateBuffer { float gate[]; };
+layout(set = 0, binding = 2, std430) readonly buffer ProjectionBuffer { uint projection[]; };
+layout(push_constant) uniform Push { uint p[2]; } pc;
+float decode(uint bits) { return uintBitsToFloat(bits << 16u); }
+uint encode(float value) {
+    uint bits = floatBitsToUint(value);
+    bits += 0x7fffu + ((bits >> 16u) & 1u);
+    return bits >> 16u;
+}
+void main() {
+    // Apply one FP32 gate to two packed-BF16 residual components
+    uint pair = gl_GlobalInvocationID.x;
+    uint index = pair * 2u;
+    uint count = pc.p[0] * pc.p[1];
+    if (index >= count) return;
+    uint column = index % pc.p[1];
+    uint out_pair = output_data[pair];
+    uint proj_pair = projection[pair];
+    float low = decode(out_pair & 0xffffu) + gate[column] *
+                decode(proj_pair & 0xffffu);
+    float high = 0.0;
+    if (index + 1u < count)
+        high = decode(out_pair >> 16u) + gate[column + 1u] *
+               decode(proj_pair >> 16u);
+    output_data[pair] = encode(low) | (encode(high) << 16u);
+}

@@ -1,0 +1,37 @@
+#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) buffer QBuffer { uint q[]; };
+layout(set = 0, binding = 1, std430) buffer KBuffer { uint k[]; };
+layout(set = 0, binding = 2, std430) readonly buffer CosBuffer { float cos_freq[]; };
+layout(set = 0, binding = 3, std430) readonly buffer SinBuffer { float sin_freq[]; };
+layout(push_constant) uniform Push { uint p[3]; } pc;
+float decode(uint packed, uint high) {
+    uint bits = high == 0u ? packed & 0xffffu : packed >> 16u;
+    return uintBitsToFloat(bits << 16u);
+}
+uint encode(float value) {
+    uint bits = floatBitsToUint(value);
+    bits += 0x7fffu + ((bits >> 16u) & 1u);
+    return bits >> 16u;
+}
+void main() {
+    // Rotate one adjacent component pair in Q and K
+    uint pair = gl_GlobalInvocationID.x;
+    uint seq = pc.p[0], heads = pc.p[1], head_dim = pc.p[2];
+    uint pairs_per_head = head_dim / 2u;
+    if (pair >= seq * heads * pairs_per_head) return;
+    uint position = pair / (heads * pairs_per_head);
+    uint remainder = pair - position * heads * pairs_per_head;
+    uint head = remainder / pairs_per_head;
+    uint pair_in_head = remainder - head * pairs_per_head;
+    uint base = position * heads * head_dim + head * head_dim + pair_in_head * 2u;
+    float c = cos_freq[position * head_dim + pair_in_head * 2u];
+    float s = sin_freq[position * head_dim + pair_in_head * 2u];
+    uint qp = q[base >> 1u], kp = k[base >> 1u];
+    float q0 = decode(qp, 0u), q1 = decode(qp, 1u);
+    float k0 = decode(kp, 0u), k1 = decode(kp, 1u);
+    q[base >> 1u] = encode(q0 * c - q1 * s) |
+                     (encode(q0 * s + q1 * c) << 16u);
+    k[base >> 1u] = encode(k0 * c - k1 * s) |
+                     (encode(k0 * s + k1 * c) << 16u);
+}

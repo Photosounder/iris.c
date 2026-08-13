@@ -1,0 +1,50 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0, std430) buffer QBuffer { uint q[]; };
+layout(set = 0, binding = 1, std430) buffer KBuffer { uint k[]; };
+layout(set = 0, binding = 2, std430) readonly buffer QWeightBuffer { float q_weight[]; };
+layout(set = 0, binding = 3, std430) readonly buffer KWeightBuffer { float k_weight[]; };
+layout(push_constant) uniform Push { uint p[4]; } pc;
+float decode(uint packed, uint index) {
+    uint bits = (index & 1u) == 0u ? packed & 0xffffu : packed >> 16u;
+    return uintBitsToFloat(bits << 16u);
+}
+uint encode(float value) {
+    uint bits = floatBitsToUint(value);
+    bits += 0x7fffu + ((bits >> 16u) & 1u);
+    return bits >> 16u;
+}
+void main() {
+    // Assign one subgroup each to Q and K for a sequence-head pair
+    uint lane = gl_SubgroupInvocationID;
+    uint target = gl_SubgroupID;
+    uint group = gl_WorkGroupID.x;
+    uint heads = pc.p[1], head_dim = pc.p[2];
+    uint head = group - (group / heads) * heads;
+    uint base = (group / heads) * heads * head_dim + head * head_dim;
+    float sum = 0.0;
+    for (uint d = lane; d < head_dim; d += 32u) {
+        uint source = base + d;
+        float value = target == 0u
+            ? decode(q[source >> 1u], source)
+            : decode(k[source >> 1u], source);
+        sum += value * value;
+    }
+    float inverse_rms = inversesqrt(subgroupAdd(sum) / float(head_dim) +
+                                     uintBitsToFloat(pc.p[3]));
+    for (uint pair = lane; pair * 2u < head_dim; pair += 32u) {
+        uint d = pair * 2u;
+        uint source = base + d;
+        float low_value = target == 0u
+            ? decode(q[source >> 1u], source) * q_weight[d]
+            : decode(k[source >> 1u], source) * k_weight[d];
+        float high_value = target == 0u
+            ? decode(q[(source + 1u) >> 1u], source + 1u) * q_weight[d + 1u]
+            : decode(k[(source + 1u) >> 1u], source + 1u) * k_weight[d + 1u];
+        uint packed = encode(low_value * inverse_rms) |
+                      (encode(high_value * inverse_rms) << 16u);
+        if (target == 0u) q[source >> 1u] = packed;
+        else k[source >> 1u] = packed;
+    }
+}
