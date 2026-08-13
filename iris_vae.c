@@ -126,12 +126,13 @@ static int vae_ensure_workspace(iris_vae_t *vae, int batch, int H, int W) {
     if (!vae || batch <= 0 || H <= 0 || W <= 0 || H > vae->max_h || W > vae->max_w)
         return -1;
 
-    /* Compute the main buffer size at full resolution */
+    /* Cover the 256-channel tensor produced by the final decoder upsample */
     size_t pixels = (size_t)batch * (size_t)H * (size_t)W;
-    size_t main_size = pixels * (size_t)vae->base_channels * sizeof(float);
+    size_t base_size = pixels * (size_t)vae->base_channels * sizeof(float);
+    size_t main_size = base_size * 2;
 
     /* Compute the largest scratch size used by a residual block */
-    size_t scratch_size = main_size * 3;
+    size_t scratch_size = base_size * 3;
     size_t padded_size = (size_t)batch * (size_t)(H + 1) * (size_t)(W + 1) *
                          (size_t)vae->base_channels * sizeof(float);
     if (scratch_size < padded_size)
@@ -801,10 +802,6 @@ static iris_image *vae_decode_gpu(iris_vae_t *vae, const float *latent,
  * falling back to CPU on failure. */
 iris_image *iris_vae_decode(iris_vae_t *vae, const float *latent,
                             int batch, int latent_h, int latent_w) {
-    /* Allocate workspace for the requested output dimensions */
-    if (vae_ensure_workspace(vae, batch, latent_h * 16, latent_w * 16) != 0)
-        return NULL;
-
 #if defined(USE_METAL) || defined(USE_VULKAN)
     /* Try GPU-resident path first (eliminates CPU<->GPU round-trips per conv) */
     if (iris_metal_available()) {
@@ -813,6 +810,10 @@ iris_image *iris_vae_decode(iris_vae_t *vae, const float *latent,
         /* Fall through to CPU path on failure */
     }
 #endif
+
+    /* Allocate the larger CPU workspace only when the CPU decoder is needed */
+    if (vae_ensure_workspace(vae, batch, latent_h * 16, latent_w * 16) != 0)
+        return NULL;
 
     /*
      * Decoder path:

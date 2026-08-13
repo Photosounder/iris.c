@@ -352,7 +352,7 @@ void iris_gpu_end_batch(void) {
 
 /* 2D convolution via im2col + GEMM: reshapes input so each column is a
  * flattened receptive field, then multiplies by the kernel weight matrix.
- * Tiles spatially to bound memory usage for large feature maps. This is the
+ * Tiles the reduction axis to bound memory usage for large feature maps. This is the
  * standard approach for BLAS/GPU-friendly convolution, used throughout the
  * VAE encoder and decoder. */
 void iris_conv2d(float *out, const float *in, const float *weight, const float *bias,
@@ -362,22 +362,21 @@ void iris_conv2d(float *out, const float *in, const float *weight, const float *
     int outW = (W + 2 * padding - kW) / stride + 1;
 
 #ifdef USE_BLAS
-    /* im2col + BLAS optimization with reduction tiling for large convolutions */
+    /* im2col + BLAS optimization with reduction-axis tiles */
     int K = in_ch * kH * kW;
     int pixels = outH * outW;
     size_t col_size = (size_t)K * pixels;
     size_t max_col_size = IRIS_CONV_MAX_COL_ELEMENTS;  /* 1GB default limit */
 
-    /* Split the reduction dimension while retaining the complete spatial plane */
+    /* Bound im2col memory without introducing spatial tile boundaries */
     int tile_k = K;
     if (col_size > max_col_size) {
         tile_k = (int)(max_col_size / (size_t)pixels);
         if (tile_k < 1) tile_k = 1;
     }
-
-    size_t tile_col_size = (size_t)tile_k * pixels;
-    float *col = malloc(tile_col_size * sizeof(float));
+    float *col = malloc((size_t)tile_k * pixels * sizeof(float));
     if (!col) {
+        free(col);
         goto naive_fallback;
     }
 
@@ -385,48 +384,43 @@ void iris_conv2d(float *out, const float *in, const float *weight, const float *
         const float *in_b = in + b * in_ch * H * W;
         float *out_b = out + b * out_ch * outH * outW;
 
-        /* Accumulate reduction tiles without introducing spatial boundaries */
+        /* Accumulate complete image planes over bounded channel slices */
+        int first_tile = 1;
         for (int k_start = 0; k_start < K; k_start += tile_k) {
             int k_count = K - k_start;
             if (k_count > tile_k) k_count = tile_k;
-
-            /* Materialize complete output planes for this kernel-channel slice */
             for (int local_k = 0; local_k < k_count; local_k++) {
                 int kernel_index = k_start + local_k;
                 int ic = kernel_index / (kH * kW);
                 int kernel_offset = kernel_index % (kH * kW);
                 int kh = kernel_offset / kW;
                 int kw = kernel_offset % kW;
-                float *col_plane = col + (size_t)local_k * pixels;
-                for (int oh = 0; oh < outH; oh++) {
-                    for (int ow = 0; ow < outW; ow++) {
-                        int ih = oh * stride - padding + kh;
-                        int iw = ow * stride - padding + kw;
-                        int pixel = oh * outW + ow;
-                        if (ih >= 0 && ih < H && iw >= 0 && iw < W)
-                            col_plane[pixel] = in_b[ic * H * W + ih * W + iw];
-                        else
-                            col_plane[pixel] = 0.0f;
-                    }
+                float *col_row = col + (size_t)local_k * pixels;
+                for (int pixel = 0; pixel < pixels; pixel++) {
+                    int oh = pixel / outW;
+                    int ow = pixel - oh * outW;
+                    int ih = oh * stride - padding + kh;
+                    int iw = ow * stride - padding + kw;
+                    col_row[pixel] =
+                        ih >= 0 && ih < H && iw >= 0 && iw < W
+                        ? in_b[ic * H * W + ih * W + iw] : 0.0f;
                 }
             }
 
-            /* Accumulate each reduction slice into the full contiguous NCHW plane */
+            /* Accumulate each channel slice into the full output tensor */
             cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                         out_ch, pixels, k_count,
-                        1.0f, weight + k_start, K,
-                        col, pixels,
-                        k_start == 0 ? 0.0f : 1.0f, out_b, pixels);
+                        1.0f, weight + k_start, K, col, pixels,
+                        first_tile ? 0.0f : 1.0f, out_b, pixels);
+            first_tile = 0;
         }
 
-        /* Add bias */
-        if (bias != NULL) {
+        /* Add bias after all reduction tiles have been accumulated */
+        if (bias) {
             for (int oc = 0; oc < out_ch; oc++) {
-                float b_val = bias[oc];
-                float *out_ch_ptr = out_b + oc * outH * outW;
-                for (int i = 0; i < outH * outW; i++) {
-                    out_ch_ptr[i] += b_val;
-                }
+                float *dst = out_b + (size_t)oc * pixels;
+                float bias_value = bias[oc];
+                for (int i = 0; i < pixels; i++) dst[i] += bias_value;
             }
         }
     }
@@ -511,33 +505,33 @@ void iris_group_norm(float *out, const float *x, const float *gamma, const float
             int c_start = g * channels_per_group;
             int c_end = c_start + channels_per_group;
 
-            float mean = 0.0f;
-            int count = 0;
+            /* Accumulate large spatial reductions without resolution-dependent drift */
+            double sum = 0.0;
+            size_t count = 0;
             for (int c = c_start; c < c_end; c++) {
                 for (int i = 0; i < spatial; i++) {
                     int idx = b * channels * spatial + c * spatial + i;
-                    mean += x[idx];
+                    sum += (double)x[idx];
                     count++;
                 }
             }
-            mean /= count;
+            double mean = sum / (double)count;
 
-            float var = 0.0f;
+            /* Preserve small residuals when the group contains millions of samples */
+            double variance_sum = 0.0;
             for (int c = c_start; c < c_end; c++) {
                 for (int i = 0; i < spatial; i++) {
                     int idx = b * channels * spatial + c * spatial + i;
-                    float diff = x[idx] - mean;
-                    var += diff * diff;
+                    double diff = (double)x[idx] - mean;
+                    variance_sum += diff * diff;
                 }
             }
-            var /= count;
-
-            float std_inv = 1.0f / sqrtf(var + eps);
+            float std_inv = (float)(1.0 / sqrt(variance_sum / (double)count + eps));
 
             for (int c = c_start; c < c_end; c++) {
                 for (int i = 0; i < spatial; i++) {
                     int idx = b * channels * spatial + c * spatial + i;
-                    float norm = (x[idx] - mean) * std_inv;
+                    float norm = (float)((double)x[idx] - mean) * std_inv;
                     out[idx] = gamma[c] * norm + beta[c];
                 }
             }

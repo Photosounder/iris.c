@@ -1533,6 +1533,13 @@ static float *zi_transformer_forward_gpu(zi_transformer_t *tf,
                                           float timestep,
                                           const float *cap_feats,
                                           int cap_seq_len) {
+#ifdef USE_VULKAN
+    /* Restore FP8 weights after a preview or VAE decode reclaimed VRAM */
+    if (tf->fp8_weights && iris_metal_fp8_cache_used() == 0) {
+        iris_metal_clear_weight_cache_only();
+        iris_warmup_bf16_zimage(tf);
+    }
+#endif
     int dim = tf->dim;
     int ps = tf->patch_size;
     int in_ch = tf->in_channels;

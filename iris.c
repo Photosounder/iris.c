@@ -759,6 +759,10 @@ static iris_image *iris_generate_zimage_with_embeddings(iris_ctx *ctx,
     /* Decode latent to image */
     iris_image *img = NULL;
     if (ctx->vae) {
+#ifdef USE_VULKAN
+        /* Denoising is complete, so give its weight cache VRAM to the VAE */
+        iris_metal_clear_weight_cache_only();
+#endif
         if (iris_phase_callback) iris_phase_callback("decoding image", 0);
         img = iris_vae_decode(ctx->vae, latent, 1, post_h, post_w);
         if (iris_phase_callback) iris_phase_callback("decoding image", 1);

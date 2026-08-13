@@ -1552,7 +1552,24 @@ void iris_metal_cleanup(void) {
 void iris_metal_reset(void) { vk_clear_cache(); }
 void iris_metal_rope_cache_begin(void) { }
 void iris_metal_reset_transient(void) { }
-void iris_metal_clear_weight_cache_only(void) { vk_clear_cache(); }
+void iris_metal_clear_weight_cache_only(void) {
+    if (!vk_ready()) return;
+
+    /* Finish all users before releasing transformer weights and matrix scratch */
+    iris_gpu_sync();
+    vk_clear_cache();
+    vk_tensor_destroy(vk_ctx.stream_weight);
+    vk_tensor_destroy(vk_ctx.stream_staging);
+    vk_tensor_destroy(vk_ctx.decoded_weight);
+    vk_ctx.stream_weight = NULL;
+    vk_ctx.stream_staging = NULL;
+    vk_ctx.decoded_weight = NULL;
+    vk_ctx.stream_weight_bytes = 0;
+    vk_ctx.decoded_weight_bytes = 0;
+    vk_ctx.stream_source = NULL;
+    vk_ctx.stream_source_bytes = 0;
+    vk_ctx.stream_source_fp8 = 0;
+}
 void iris_metal_clear_bf16_cache_only(void) { vk_clear_cache_kind(1); }
 void iris_metal_clear_f16_cache_only(void) { }
 void iris_metal_clear_activation_pool_only(void) { }

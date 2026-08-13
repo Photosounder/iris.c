@@ -14,7 +14,7 @@
 #include <math.h>
 #include <time.h>
 
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_VULKAN)
 #include "iris_metal.h"
 #endif
 
@@ -437,6 +437,10 @@ float *iris_sample_euler_zimage(void *transformer,
                 decode_w = step_w;
             }
 
+#ifdef USE_VULKAN
+            /* Reclaim transformer VRAM before the high-resolution preview decoder */
+            iris_metal_clear_weight_cache_only();
+#endif
             iris_image *img = iris_vae_decode((iris_vae_t *)iris_step_image_vae,
                                               decode_latent, 1, decode_h, decode_w);
             if (img) {
