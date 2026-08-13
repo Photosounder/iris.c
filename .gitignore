@@ -5,6 +5,7 @@
 flux
 iris
 iris.exe
+iris_copy.exe
 
 # Model weights (large files)
 flux-klein-*/
