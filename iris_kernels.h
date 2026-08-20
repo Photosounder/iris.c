@@ -63,6 +63,15 @@ void iris_matmul(float *C, const float *A, const float *B,
 void iris_matmul_t(float *C, const float *A, const float *B,
                    int M, int K, int N);
 
+/* Convert scaled finite-numbers E4M3 weights into f32 */
+void iris_f8_e4m3_to_f32(float *restrict dst, const uint8_t *restrict src,
+                         size_t count, float scale);
+
+/* Matrix multiplication with a transposed scaled E4M3 weight matrix */
+int iris_matmul_t_f8_e4m3(float *C, const float *A, const uint8_t *B,
+                          float weight_scale, int M, int K, int N,
+                          float *workspace, size_t workspace_elements);
+
 /*
  * Linear layer: y = x @ W^T + b (if b != NULL)
  * x: [seq_len, in_dim], W: [out_dim, in_dim], b: [out_dim], y: [seq_len, out_dim]

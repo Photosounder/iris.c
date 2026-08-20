@@ -1,8 +1,10 @@
 # Welcome to Michel's edition of iris.c
 
-I, Michel Rouzic, defiler of codebases, have struck again and commited another AI crime against maintainability. I took the original [iris.c](https://github.com/antirez/iris.c) which was macOS/Linux only with only CPU/Metal backends and made it work on Windows with a Vulkan backend. I also made it work with FP8 models (on Vulkan, not on the CPU). As a result there are a couple of new command line options:
+I, Michel Rouzic, defiler of codebases, have struck again and commited another AI crime against maintainability. I took the original [iris.c](https://github.com/antirez/iris.c) which was macOS/Linux only with only CPU/Metal backends and made it work on Windows with a Vulkan backend. Scaled E4M3FN FP8 Z-Image models work with both Vulkan and CPU builds. As a result there are a couple of new command line options:
 
 * `--transformer <path to model>` Specify where the model is. For instance I use `--transformer "E:\ComfyUI_windows_portable\ComfyUI\models\diffusion_models\zImageTurboQuantized_fp8ScaledE4m3fnKJ.safetensors"`.
+
+  CPU builds keep the large E4M3FN matrices memory-mapped and decode scaled output-row panels into a small reusable FP32 workspace before each matrix multiplication. `make blas` uses OpenBLAS for these panel multiplications; `make windows` also works through the generic CPU fallback but is much slower.
 
 * `--gpu-friendly` avoids making your computer lag hard while it runs.
 

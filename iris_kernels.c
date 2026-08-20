@@ -218,6 +218,95 @@ void iris_matmul_t(float *C, const float *A, const float *B,
 #endif
 }
 
+/* Convert scaled E4M3FN values in fixed-size groups that vectorize cleanly */
+void iris_f8_e4m3_to_f32(float *restrict dst, const uint8_t *restrict src,
+                         size_t count, float scale) {
+    size_t i = 0;
+
+    /* Expand sixteen bytes at a time into exact IEEE-754 bit patterns */
+    for (; i + 16 <= count; i += 16) {
+        uint32_t decoded[16];
+        for (size_t lane = 0; lane < 16; lane++) {
+            uint32_t value = src[i + lane];
+            uint32_t sign = (value & 0x80u) << 24;
+            uint32_t exponent = (value >> 3) & 0x0fu;
+            uint32_t mantissa = value & 0x07u;
+            uint32_t normal = ((exponent + 120u) << 23) | (mantissa << 20);
+            float subnormal = (float)mantissa * (1.0f / 512.0f);
+            uint32_t subnormal_bits;
+            memcpy(&subnormal_bits, &subnormal, sizeof(subnormal_bits));
+            uint32_t subnormal_mask = 0u - (uint32_t)(exponent == 0u);
+            uint32_t nan_mask = 0u - (uint32_t)(exponent == 15u && mantissa == 7u);
+            uint32_t magnitude = (normal & ~subnormal_mask) |
+                                 (subnormal_bits & subnormal_mask);
+            magnitude = (magnitude & ~nan_mask) | (0x7fc00000u & nan_mask);
+            decoded[lane] = sign | magnitude;
+        }
+        memcpy(dst + i, decoded, sizeof(decoded));
+
+        /* Apply the Kijai per-tensor multiplier after exact format expansion */
+        for (size_t lane = 0; lane < 16; lane++) dst[i + lane] *= scale;
+    }
+
+    /* Decode a short tail with the same branchless selection logic */
+    for (; i < count; i++) {
+        uint32_t value = src[i];
+        uint32_t sign = (value & 0x80u) << 24;
+        uint32_t exponent = (value >> 3) & 0x0fu;
+        uint32_t mantissa = value & 0x07u;
+        uint32_t normal = ((exponent + 120u) << 23) | (mantissa << 20);
+        float subnormal = (float)mantissa * (1.0f / 512.0f);
+        uint32_t subnormal_bits;
+        memcpy(&subnormal_bits, &subnormal, sizeof(subnormal_bits));
+        uint32_t subnormal_mask = 0u - (uint32_t)(exponent == 0u);
+        uint32_t nan_mask = 0u - (uint32_t)(exponent == 15u && mantissa == 7u);
+        uint32_t magnitude = (normal & ~subnormal_mask) |
+                             (subnormal_bits & subnormal_mask);
+        magnitude = (magnitude & ~nan_mask) | (0x7fc00000u & nan_mask);
+        uint32_t decoded = sign | magnitude;
+        memcpy(dst + i, &decoded, sizeof(decoded));
+        dst[i] *= scale;
+    }
+}
+
+/* Multiply by mapped FP8 weights through a reusable f32 decode panel */
+int iris_matmul_t_f8_e4m3(float *C, const float *A, const uint8_t *B,
+                          float weight_scale, int M, int K, int N,
+                          float *workspace, size_t workspace_elements) {
+    /* Validate dimensions and require room for at least one complete weight row */
+    if (!C || !A || !B || !workspace || M <= 0 || K <= 0 || N <= 0 ||
+        workspace_elements < (size_t)K)
+        return 0;
+
+#ifdef USE_BLAS
+    /* Decode as many output rows as fit and let BLAS reuse each panel across M */
+    size_t panel_rows = workspace_elements / (size_t)K;
+    if (panel_rows > (size_t)N) panel_rows = (size_t)N;
+    for (int n = 0; n < N; n += (int)panel_rows) {
+        int rows = N - n;
+        if ((size_t)rows > panel_rows) rows = (int)panel_rows;
+        iris_f8_e4m3_to_f32(workspace, B + (size_t)n * K,
+                            (size_t)rows * K, weight_scale);
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    M, rows, K, 1.0f, A, K, workspace, K,
+                    0.0f, C + n, N);
+    }
+#else
+    /* Decode each weight row once for the dependency-free CPU implementation */
+    for (int n = 0; n < N; n++) {
+        iris_f8_e4m3_to_f32(workspace, B + (size_t)n * K,
+                            (size_t)K, weight_scale);
+        for (int m = 0; m < M; m++) {
+            const float *a = A + (size_t)m * K;
+            float sum = 0.0f;
+            for (int k = 0; k < K; k++) sum += a[k] * workspace[k];
+            C[(size_t)m * N + n] = sum;
+        }
+    }
+#endif
+    return 1;
+}
+
 void iris_linear(float *y, const float *x, const float *W, const float *b,
                  int seq_len, int in_dim, int out_dim) {
     /* y[seq, out] = x[seq, in] @ W[out, in]^T + b[out] */
