@@ -90,12 +90,13 @@ typedef struct {
     float guidance;         /* CFG guidance scale (0 = auto from model type) */
     int schedule;           /* Schedule type (IRIS_SCHEDULE_*) */
     float power_alpha;      /* Exponent for power schedule (default: 2.0) */
+    float text_noise;       /* Scale of quasi-Gaussian text embedding noise */
 } iris_params;
 
 /* Default parameters */
 #define IRIS_DEFAULT_WIDTH  256
 #define IRIS_DEFAULT_HEIGHT 256
-#define IRIS_PARAMS_DEFAULT { IRIS_DEFAULT_WIDTH, IRIS_DEFAULT_HEIGHT, 0, -1, 0.0f, IRIS_SCHEDULE_DEFAULT, 2.0f }
+#define IRIS_PARAMS_DEFAULT { IRIS_DEFAULT_WIDTH, IRIS_DEFAULT_HEIGHT, 0, -1, 0.0f, IRIS_SCHEDULE_DEFAULT, 2.0f, 0.0f }
 
 /* ========================================================================
  * Core API

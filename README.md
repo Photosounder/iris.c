@@ -238,6 +238,7 @@ Done -> /tmp/iris-.../image-0003.png (ref $2)
 -s, --steps N         Sampling steps (default: auto, 4 distilled / 50 base / 9 zimage)
 -S, --seed N          Random seed for reproducibility
 -g, --guidance N      CFG guidance scale (default: auto, 1.0 distilled / 4.0 base / 0.0 zimage)
+    --text-noise N     Add scaled quasi-Gaussian e^(-x^2) noise to text embeddings
     --linear          Use linear timestep schedule (see below)
     --power           Use power curve timestep schedule (see below)
     --power-alpha N   Set power schedule exponent (default: 2.0)
@@ -812,13 +813,13 @@ typedef struct {
     int num_steps;          /* Denoising steps, 0 = auto (4 distilled, 50 base, 9 zimage) */
     int64_t seed;           /* Random seed, -1 for random (default: -1) */
     float guidance;         /* CFG guidance scale, 0 = auto (1.0 distilled, 4.0 base, 0.0 zimage) */
-    int linear_schedule;    /* Use linear timestep schedule (0 = shifted sigmoid) */
-    int power_schedule;     /* Use power curve timestep schedule */
+    int schedule;           /* Schedule type (IRIS_SCHEDULE_*) */
     float power_alpha;      /* Exponent for power schedule (default: 2.0) */
+    float text_noise;       /* Scale of quasi-Gaussian text embedding noise */
 } iris_params;
 
 /* Initialize with sensible defaults (auto steps and guidance from model type) */
-#define IRIS_PARAMS_DEFAULT { 256, 256, 0, -1, 0.0f, 0, 0, 2.0f }
+#define IRIS_PARAMS_DEFAULT { 256, 256, 0, -1, 0.0f, 0, 2.0f, 0.0f }
 ```
 
 ## Debugging

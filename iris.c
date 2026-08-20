@@ -661,6 +661,60 @@ float *iris_encode_text(iris_ctx *ctx, const char *prompt, int *out_seq_len) {
     return embeddings;
 }
 
+/* Hash a sequence position with the xorshift-multiply generator from rouziclib */
+static uint32_t iris_rand_xsm32(uint32_t x) {
+    /* Mix all input bits into the output word */
+    x ^= x >> 16;
+    x *= 0x21f0aaadu;
+    x ^= x >> 15;
+    x *= 0x735a2d97u;
+    x ^= x >> 15;
+    return x;
+}
+
+/* Add deterministic four-uniform noise approximating a density proportional
+ * to exp(-x*x), which has variance 1/2. */
+static void iris_add_text_noise(float *embeddings, size_t count, float scale,
+                                int64_t seed, uint32_t domain) {
+    /* Leave embeddings untouched when perturbation is disabled or impossible */
+    if (!embeddings || count == 0 || scale == 0.0f) return;
+
+    /* Fold the full seed into an independent nonzero sequence position */
+    uint64_t seed_bits = (uint64_t)seed;
+    uint32_t position = (uint32_t)seed_bits ^ (uint32_t)(seed_bits >> 32) ^ domain;
+
+    /* Sum four uniforms and scale variance 1/3 to the requested variance 1/2 */
+    const float uniform_scale = 1.0f / 16777216.0f;
+    const float gaussian_scale = 1.224744871391589f;
+    for (size_t i = 0; i < count; i++) {
+        float sum = 0.0f;
+        for (int j = 0; j < 4; j++) {
+            sum += (float)(iris_rand_xsm32(position++) >> 8) * uniform_scale;
+        }
+        embeddings[i] += (sum - 2.0f) * gaussian_scale * scale;
+    }
+}
+
+/* Copy caller-owned embeddings and perturb the copy when noise is enabled */
+static const float *iris_prepare_text_embeddings(const float *embeddings,
+                                                  size_t count, float scale,
+                                                  int64_t seed, uint32_t domain,
+                                                  float **owned_copy) {
+    /* Reuse the original read-only buffer when no copy is needed */
+    *owned_copy = NULL;
+    if (scale == 0.0f || count == 0) return embeddings;
+
+    /* Preserve externally supplied and cached embedding buffers */
+    *owned_copy = (float *)malloc(count * sizeof(float));
+    if (!*owned_copy) {
+        set_error("Failed to allocate noisy text embeddings");
+        return NULL;
+    }
+    memcpy(*owned_copy, embeddings, count * sizeof(float));
+    iris_add_text_noise(*owned_copy, count, scale, seed, domain);
+    return *owned_copy;
+}
+
 /* ========================================================================
  * Z-Image Generation
  * ======================================================================== */
@@ -687,6 +741,9 @@ static iris_image *iris_generate_zimage_with_embeddings(iris_ctx *ctx,
         p = (iris_params)IRIS_PARAMS_DEFAULT;
     }
 
+    /* Resolve one seed for both text perturbation and latent noise */
+    if (p.seed < 0) p.seed = (int64_t)time(NULL);
+
     /* Validate dimensions */
     if (p.width <= 0) p.width = 1024;   /* Z-Image default: 1024x1024 */
     if (p.height <= 0) p.height = 1024;
@@ -702,11 +759,19 @@ static iris_image *iris_generate_zimage_with_embeddings(iris_ctx *ctx,
         return NULL;
     }
 
+    /* Prepare noisy embeddings before either CPU or Vulkan consumes them */
+    float *owned_text_emb = NULL;
+    const float *sample_text_emb = iris_prepare_text_embeddings(
+        text_emb, (size_t)text_seq * ctx->text_dim, p.text_noise, p.seed,
+        0x6a09e667u, &owned_text_emb);
+    if (!sample_text_emb) return NULL;
+
     /* Release text encoder to free memory before loading transformer */
     iris_release_text_encoder(ctx);
 
     /* Load Z-Image transformer on-demand (persistent across generations). */
     if (!iris_load_zimage_transformer_if_needed(ctx)) {
+        free(owned_text_emb);
         return NULL;
     }
 
@@ -724,8 +789,7 @@ static iris_image *iris_generate_zimage_with_embeddings(iris_ctx *ctx,
     int image_seq_len = post_h * post_w;
 
     /* Initialize noise at pre-patchification dimensions: [in_ch, H/8, W/8] */
-    int64_t seed = (p.seed < 0) ? (int64_t)time(NULL) : p.seed;
-    float *z = iris_init_noise(1, in_ch, pre_h, pre_w, seed);
+    float *z = iris_init_noise(1, in_ch, pre_h, pre_w, p.seed);
 
     /* Get Z-Image schedule (default FlowMatch; linear/power if explicitly requested). */
     float *schedule = iris_selected_zimage_schedule(&p, image_seq_len);
@@ -735,13 +799,14 @@ static iris_image *iris_generate_zimage_with_embeddings(iris_ctx *ctx,
     float *denoised = iris_sample_euler_zimage(
         ctx->zi_transformer, z, 1, in_ch, pre_h, pre_w,
         ps,
-        text_emb, text_seq,
+        sample_text_emb, text_seq,
         schedule, p.num_steps,
         NULL
     );
 
     free(z);
     free(schedule);
+    free(owned_text_emb);
 
     if (!denoised) {
         set_error("Sampling failed");
@@ -817,6 +882,9 @@ iris_image *iris_generate(iris_ctx *ctx, const char *prompt,
         p = (iris_params)IRIS_PARAMS_DEFAULT;
     }
 
+    /* Resolve one seed for both text perturbation and latent noise */
+    if (p.seed < 0) p.seed = (int64_t)time(NULL);
+
     /* Validate dimensions */
     if (p.width <= 0) p.width = IRIS_DEFAULT_WIDTH;
     if (p.height <= 0) p.height = IRIS_DEFAULT_HEIGHT;
@@ -852,6 +920,13 @@ iris_image *iris_generate(iris_ctx *ctx, const char *prompt,
         }
     }
 
+    /* Perturb conditional and CFG embeddings with independent deterministic streams */
+    iris_add_text_noise(text_emb, (size_t)text_seq * ctx->text_dim,
+                        p.text_noise, p.seed, 0x6a09e667u);
+    iris_add_text_noise(text_emb_uncond,
+                        (size_t)text_seq_uncond * ctx->text_dim,
+                        p.text_noise, p.seed, 0xbb67ae85u);
+
     /* Release text encoder to free ~8GB before loading transformer */
     iris_release_text_encoder(ctx);
 
@@ -868,8 +943,7 @@ iris_image *iris_generate(iris_ctx *ctx, const char *prompt,
     int image_seq_len = latent_h * latent_w;
 
     /* Initialize noise */
-    int64_t seed = (p.seed < 0) ? (int64_t)time(NULL) : p.seed;
-    float *z = iris_init_noise(1, IRIS_LATENT_CHANNELS, latent_h, latent_w, seed);
+    float *z = iris_init_noise(1, IRIS_LATENT_CHANNELS, latent_h, latent_w, p.seed);
 
     /* Get schedule */
     float *schedule = iris_selected_schedule(&p, image_seq_len);
@@ -960,6 +1034,9 @@ iris_image *iris_generate_with_embeddings(iris_ctx *ctx,
         p = (iris_params)IRIS_PARAMS_DEFAULT;
     }
 
+    /* Resolve one seed for both text perturbation and latent noise */
+    if (p.seed < 0) p.seed = (int64_t)time(NULL);
+
     /* Validate dimensions */
     if (p.width <= 0) p.width = IRIS_DEFAULT_WIDTH;
     if (p.height <= 0) p.height = IRIS_DEFAULT_HEIGHT;
@@ -974,14 +1051,20 @@ iris_image *iris_generate_with_embeddings(iris_ctx *ctx,
         return NULL;
     }
 
+    /* Copy and perturb caller-owned embeddings only when requested */
+    float *owned_text_emb = NULL;
+    const float *sample_text_emb = iris_prepare_text_embeddings(
+        text_emb, (size_t)text_seq * ctx->text_dim, p.text_noise, p.seed,
+        0x6a09e667u, &owned_text_emb);
+    if (!sample_text_emb) return NULL;
+
     /* Compute latent dimensions */
     int latent_h = p.height / 16;
     int latent_w = p.width / 16;
     int image_seq_len = latent_h * latent_w;
 
     /* Initialize noise */
-    int64_t seed = (p.seed < 0) ? (int64_t)time(NULL) : p.seed;
-    float *z = iris_init_noise(1, IRIS_LATENT_CHANNELS, latent_h, latent_w, seed);
+    float *z = iris_init_noise(1, IRIS_LATENT_CHANNELS, latent_h, latent_w, p.seed);
 
     /* Get schedule */
     float *schedule = iris_selected_schedule(&p, image_seq_len);
@@ -991,13 +1074,14 @@ iris_image *iris_generate_with_embeddings(iris_ctx *ctx,
     float *latent = iris_sample_euler_flux(
         ctx->transformer, ctx->qwen3_encoder,
         z, 1, IRIS_LATENT_CHANNELS, latent_h, latent_w,
-        text_emb, text_seq,
+        sample_text_emb, text_seq,
         schedule, p.num_steps,
         NULL  /* progress_callback */
     );
 
     free(z);
     free(schedule);
+    free(owned_text_emb);
 
     if (!latent) {
         set_error("Sampling failed");
@@ -1048,6 +1132,9 @@ iris_image *iris_generate_with_embeddings_and_noise(iris_ctx *ctx,
         p = (iris_params)IRIS_PARAMS_DEFAULT;
     }
 
+    /* Resolve one seed for text perturbation even when latent noise is external */
+    if (p.seed < 0) p.seed = (int64_t)time(NULL);
+
     /* Validate dimensions */
     if (p.width <= 0) p.width = IRIS_DEFAULT_WIDTH;
     if (p.height <= 0) p.height = IRIS_DEFAULT_HEIGHT;
@@ -1076,6 +1163,13 @@ iris_image *iris_generate_with_embeddings_and_noise(iris_ctx *ctx,
         return NULL;
     }
 
+    /* Copy and perturb caller-owned embeddings only when requested */
+    float *owned_text_emb = NULL;
+    const float *sample_text_emb = iris_prepare_text_embeddings(
+        text_emb, (size_t)text_seq * ctx->text_dim, p.text_noise, p.seed,
+        0x6a09e667u, &owned_text_emb);
+    if (!sample_text_emb) return NULL;
+
     /* Copy external noise */
     float *z = (float *)malloc(expected_noise_size * sizeof(float));
     memcpy(z, noise, expected_noise_size * sizeof(float));
@@ -1087,13 +1181,14 @@ iris_image *iris_generate_with_embeddings_and_noise(iris_ctx *ctx,
     float *latent = iris_sample_euler_flux(
         ctx->transformer, ctx->qwen3_encoder,
         z, 1, IRIS_LATENT_CHANNELS, latent_h, latent_w,
-        text_emb, text_seq,
+        sample_text_emb, text_seq,
         schedule, p.num_steps,
         NULL  /* progress_callback */
     );
 
     free(z);
     free(schedule);
+    free(owned_text_emb);
 
     if (!latent) {
         set_error("Sampling failed");
@@ -1211,6 +1306,9 @@ iris_image *iris_img2img(iris_ctx *ctx, const char *prompt,
         p = (iris_params)IRIS_PARAMS_DEFAULT;
     }
 
+    /* Resolve one seed for both text perturbation and latent noise */
+    if (p.seed < 0) p.seed = (int64_t)time(NULL);
+
     /* Use input image dimensions if not specified */
     if (p.width <= 0) p.width = input->width;
     if (p.height <= 0) p.height = input->height;
@@ -1278,6 +1376,13 @@ iris_image *iris_img2img(iris_ctx *ctx, const char *prompt,
         }
     }
 
+    /* Perturb conditional and CFG embeddings with independent deterministic streams */
+    iris_add_text_noise(text_emb, (size_t)text_seq * ctx->text_dim,
+                        p.text_noise, p.seed, 0x6a09e667u);
+    iris_add_text_noise(text_emb_uncond,
+                        (size_t)text_seq_uncond * ctx->text_dim,
+                        p.text_noise, p.seed, 0xbb67ae85u);
+
     /* Release text encoder to free ~8GB before loading transformer */
     iris_release_text_encoder(ctx);
 
@@ -1337,8 +1442,7 @@ iris_image *iris_img2img(iris_ctx *ctx, const char *prompt,
     float *schedule = iris_selected_schedule(&p, image_seq_len);
 
     /* Initialize target latent with pure noise */
-    int64_t seed = (p.seed < 0) ? (int64_t)time(NULL) : p.seed;
-    float *z = iris_init_noise(1, IRIS_LATENT_CHANNELS, out_lat_h, out_lat_w, seed);
+    float *z = iris_init_noise(1, IRIS_LATENT_CHANNELS, out_lat_h, out_lat_w, p.seed);
 
     /* Reference image latent is img_latent, with T offset = 10 */
     int t_offset = 10;
@@ -1430,6 +1534,9 @@ iris_image *iris_multiref(iris_ctx *ctx, const char *prompt,
         p = (iris_params)IRIS_PARAMS_DEFAULT;
     }
 
+    /* Resolve one seed for both text perturbation and latent noise */
+    if (p.seed < 0) p.seed = (int64_t)time(NULL);
+
     /* Use first reference dimensions if not specified */
     if (p.width <= 0) p.width = refs[0]->width;
     if (p.height <= 0) p.height = refs[0]->height;
@@ -1467,6 +1574,13 @@ iris_image *iris_multiref(iris_ctx *ctx, const char *prompt,
             return NULL;
         }
     }
+
+    /* Perturb conditional and CFG embeddings with independent deterministic streams */
+    iris_add_text_noise(text_emb, (size_t)text_seq * ctx->text_dim,
+                        p.text_noise, p.seed, 0x6a09e667u);
+    iris_add_text_noise(text_emb_uncond,
+                        (size_t)text_seq_uncond * ctx->text_dim,
+                        p.text_noise, p.seed, 0xbb67ae85u);
 
     iris_release_text_encoder(ctx);
 
@@ -1571,8 +1685,7 @@ iris_image *iris_multiref(iris_ctx *ctx, const char *prompt,
     int image_seq_len = latent_h * latent_w;
 
     float *schedule = iris_selected_schedule(&p, image_seq_len);
-    int64_t seed = (p.seed < 0) ? (int64_t)time(NULL) : p.seed;
-    float *z = iris_init_noise(1, IRIS_LATENT_CHANNELS, latent_h, latent_w, seed);
+    float *z = iris_init_noise(1, IRIS_LATENT_CHANNELS, latent_h, latent_w, p.seed);
 
     /* Sample with multi-reference conditioning */
     float *latent;

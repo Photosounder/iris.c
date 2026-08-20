@@ -28,6 +28,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <math.h>
 #include <getopt.h>
 #include <time.h>
 #include <unistd.h>
@@ -225,6 +227,7 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "      --linear          Use linear timestep schedule\n");
     fprintf(stderr, "      --power           Use power curve timestep schedule (default alpha: 2.0)\n");
     fprintf(stderr, "      --power-alpha N   Set power schedule exponent (default: 2.0)\n");
+    fprintf(stderr, "      --text-noise N    Add scaled quasi-Gaussian e^(-x^2) text noise\n");
     fprintf(stderr, "      --sigmoid         Use Flux shifted sigmoid schedule\n");
     fprintf(stderr, "      --flowmatch       Use Z-Image FlowMatch Euler schedule\n\n");
     fprintf(stderr, "Model options:\n");
@@ -295,6 +298,7 @@ int main(int argc, char *argv[]) {
         {"blas-threads",required_argument, 0, 259},
         {"transformer", required_argument, 0, 262},
         {"gpu-friendly",no_argument,       0, 263},
+        {"text-noise",  required_argument, 0, 264},
         {0, 0, 0, 0}
     };
 
@@ -314,7 +318,8 @@ int main(int argc, char *argv[]) {
         .num_steps = 0,   /* 0 = auto from model type */
         .seed = -1,
         .guidance = 0.0f, /* 0 = auto from model type */
-        .power_alpha = 2.0f
+        .power_alpha = 2.0f,
+        .text_noise = 0.0f
     };
 
     int width_set = 0, height_set = 0, steps_set = 0;
@@ -371,6 +376,18 @@ int main(int argc, char *argv[]) {
             case 259: blas_threads = atoi(optarg); break;
             case 262: transformer_path = optarg; break;
             case 263: gpu_friendly = 1; break;
+            case 264: {
+                /* Parse the text noise scale without accepting malformed values */
+                char *end = NULL;
+                errno = 0;
+                float scale = strtof(optarg, &end);
+                if (errno != 0 || end == optarg || *end != '\0' || !isfinite(scale)) {
+                    fprintf(stderr, "Error: --text-noise requires a finite real value\n");
+                    return 1;
+                }
+                params.text_noise = scale;
+                break;
+            }
             default:
                 print_usage(argv[0]);
                 return 1;
@@ -476,6 +493,8 @@ int main(int argc, char *argv[]) {
     } else {
         actual_seed = (int64_t)time(NULL);
     }
+    /* Keep every seeded generation stage on the seed reported to the user */
+    params.seed = actual_seed;
     iris_set_seed(actual_seed);
     LOG_NORMAL("Seed: %lld\n", (long long)actual_seed);
 
